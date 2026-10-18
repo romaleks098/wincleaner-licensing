@@ -103,8 +103,10 @@ async def handle_buy_license(message: Message):
         "• **Навсегда (Lifetime)** — 1 990 ₽ (2 ПК)\n\n"
         "Для приобретения напишите администратору или выберите способ оплаты через поддержку."
     )
+    admin_user = settings.ADMIN_USERNAME.lstrip("@")
+    admin_url = f"https://t.me/{admin_user}" if admin_user else "https://t.me/"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Написать администратору", url="https://t.me/telegram")]
+        [InlineKeyboardButton(text="💬 Написать администратору", url=admin_url)]
     ])
     await message.answer(text, reply_markup=kb, parse_mode="Markdown")
 
@@ -194,12 +196,18 @@ async def handle_transfer_license(message: Message):
 
 @router.message(F.text == "💬 Поддержка")
 async def handle_support(message: Message):
+    admin_user = settings.ADMIN_USERNAME.lstrip("@")
+    admin_contact = f"@{admin_user}" if admin_user else "администратору"
+    admin_url = f"https://t.me/{admin_user}" if admin_user else "https://t.me/"
     text = (
         "💬 **Служба поддержки WinCleaner**\n\n"
         "Если у вас возникли технические вопросы, проблемы с активацией или сменой оборудования, обратитесь к администратору:\n"
-        "👉 @admin_username"
+        f"👉 {admin_contact}"
     )
-    await message.answer(text, parse_mode="Markdown")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать в поддержку", url=admin_url)]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 # ===========================================================================
 # Admin Commands

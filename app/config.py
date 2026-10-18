@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     BOT_TOKEN: str = ""
     BOT_USERNAME: str = "WinCleanerLicense_Bot"
     ADMIN_IDS: str = ""
+    ADMIN_USERNAME: str = "DerzhalTomik"
     ED25519_PRIVATE_KEY_HEX: str = "adbb08e9c7ed6ee0cee470ea624cc9a55b160c84ea15858cd619e0a94f18139e"
     ED25519_PUBLIC_KEY_HEX: str = "acba32615e13044a3d15823b07ed600e9384c34b79eab06aa88f8c08fada9457"
     ADMIN_SECRET: str = "super-secret-admin-token-for-api-calls"
