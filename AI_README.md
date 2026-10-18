@@ -49,6 +49,7 @@
 | **Telegram Bot** | `@WinCleanerLicense_Bot` | Бот для пользователей и администратора. |
 | **Telegram Bot Token** | `8568126661:AAGNHt9hLR1r0YtRMI0uuyoG4ZO5i6peVqU` | Токен бота BotFather. |
 | **Admin Telegram ID** | `1336498951` | ID владельца в Telegram (полные админские права в боте). |
+| **Admin Username** | `@DerzhalTomik` | Юзернейм владельца для связи в кнопках покупки и поддержки. |
 | **Admin API Secret** | `wincleaner-super-secret-admin-2026` | Передается в заголовке `X-Admin-Token` для админских REST-запросов. |
 | **Ed25519 Public Key (Hex)** | `acba32615e13044a3d15823b07ed600e9384c34b79eab06aa88f8c08fada9457` | Вшит в клиент `Licensing.cs` и конфиг сервера. |
 | **Ed25519 Private Key (Hex)** | `adbb08e9c7ed6ee0cee470ea624cc9a55b160c84ea15858cd619e0a94f18139e` | Хранится ТОЛЬКО в env-переменных Render. |
