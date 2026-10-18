@@ -1,34 +1,20 @@
 import os
 from typing import List
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-try:
-    from pydantic_settings import BaseSettings
-    class SettingsBase(BaseSettings):
-        class Config:
-            env_file = ".env"
-            extra = "allow"
-except ImportError:
-    class SettingsBase:
-        pass
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="allow")
 
-class Settings(SettingsBase):
-    def __init__(self):
-        self.HOST: str = os.getenv("HOST", "0.0.0.0")
-        self.PORT: int = int(os.getenv("PORT", "8000"))
-        self.ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
-        self.DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./licensing.db")
-        self.BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-        self.BOT_USERNAME: str = os.getenv("BOT_USERNAME", "WinCleanerLicenseBot")
-        self.ADMIN_IDS_RAW: str = os.getenv("ADMIN_IDS", "")
-        self.ED25519_PRIVATE_KEY_HEX: str = os.getenv(
-            "ED25519_PRIVATE_KEY_HEX",
-            "adbb08e9c7ed6ee0cee470ea624cc9a55b160c84ea15858cd619e0a94f18139e"
-        )
-        self.ED25519_PUBLIC_KEY_HEX: str = os.getenv(
-            "ED25519_PUBLIC_KEY_HEX",
-            "acba32615e13044a3d15823b07ed600e9384c34b79eab06aa88f8c08fada9457"
-        )
-        self.ADMIN_SECRET: str = os.getenv("ADMIN_SECRET", "super-secret-admin-token-for-api-calls")
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    ENVIRONMENT: str = "production"
+    DATABASE_URL: str = "sqlite+aiosqlite:///./licensing.db"
+    BOT_TOKEN: str = ""
+    BOT_USERNAME: str = "WinCleanerLicense_Bot"
+    ADMIN_IDS: str = ""
+    ED25519_PRIVATE_KEY_HEX: str = "adbb08e9c7ed6ee0cee470ea624cc9a55b160c84ea15858cd619e0a94f18139e"
+    ED25519_PUBLIC_KEY_HEX: str = "acba32615e13044a3d15823b07ed600e9384c34b79eab06aa88f8c08fada9457"
+    ADMIN_SECRET: str = "super-secret-admin-token-for-api-calls"
 
     @property
     def async_database_url(self) -> str:
@@ -41,10 +27,10 @@ class Settings(SettingsBase):
 
     @property
     def admin_ids(self) -> List[int]:
-        if not self.ADMIN_IDS_RAW:
+        if not self.ADMIN_IDS:
             return []
         ids = []
-        for x in self.ADMIN_IDS_RAW.split(","):
+        for x in self.ADMIN_IDS.split(","):
             s = x.strip()
             if s.isdigit():
                 ids.append(int(s))
