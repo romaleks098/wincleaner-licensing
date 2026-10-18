@@ -209,3 +209,10 @@ print("ACTIVATED:", res["status"], "SIG:", res["signature"])
 
 7. **Локальное хранилище лицензии:**
    Токен хранится в `%LOCALAPPDATA%\WinCleaner\license.dat` и зашифрован Windows DPAPI (`DataProtectionScope.CurrentUser`). Файл невозможно скопировать на другой ПК или прочитать под другой учетной записью.
+
+8. **TLS 1.2 в .NET Framework 4.0 runtime:**
+   В .NET Framework 4.0 по умолчанию `ServicePointManager.SecurityProtocol` использует только SSL 3.0 и TLS 1.0. При обращении к современным HTTPS-серверам (Cloudflare, Render) запрос падает с ошибкой: `Не удалось создать защищенный канал SSL/TLS`. В `LicenseManager` принудительно включены протоколы TLS 1.2 (код 3072) и TLS 1.3 (код 12288):
+   ```csharp
+   ServicePointManager.SecurityProtocol = (SecurityProtocolType)12288 | (SecurityProtocolType)3072 | (SecurityProtocolType)768 | (SecurityProtocolType)192;
+   ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+   ```
