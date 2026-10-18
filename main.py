@@ -25,36 +25,33 @@ bot_instance = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_task, bot_instance
-    logger.info("Initializing database tables...")
-    try:
-        await init_db()
-        logger.info("Database initialized successfully.")
-    except Exception as e:
-        logger.error(f"Error initializing database: {e}")
+    logger.info("FastAPI lifespan starting — launching background tasks...")
 
-    logger.info(f"Ed25519 Public Key: {settings.ED25519_PUBLIC_KEY_HEX}")
-
-    # Start Telegram bot polling if token provided
-    if settings.BOT_TOKEN and len(settings.BOT_TOKEN) > 10:
+    async def background_startup():
+        # Initialize DB in background without blocking HTTP healthcheck
         try:
-            bot_instance = Bot(token=settings.BOT_TOKEN)
-            dp = Dispatcher()
-            dp.include_router(bot_router)
-
-            async def run_bot():
-                logger.info("Starting Telegram Bot polling...")
-                try:
-                    await bot_instance.delete_webhook(drop_pending_updates=False)
-                    await dp.start_polling(bot_instance)
-                except Exception as e:
-                    logger.error(f"Telegram bot error: {e}")
-
-            bot_task = asyncio.create_task(run_bot())
+            await init_db()
         except Exception as e:
-            logger.error(f"Failed to start bot: {e}")
-    else:
-        logger.warning("BOT_TOKEN is not configured. Telegram bot is disabled.")
+            logger.error(f"Database startup error: {e}")
 
+        # Start Telegram bot
+        if settings.BOT_TOKEN and len(settings.BOT_TOKEN) > 10:
+            try:
+                global bot_instance
+                bot_instance = Bot(token=settings.BOT_TOKEN)
+                dp = Dispatcher()
+                dp.include_router(bot_router)
+                logger.info("Starting Telegram Bot polling...")
+                await bot_instance.delete_webhook(drop_pending_updates=False)
+                await dp.start_polling(bot_instance)
+            except Exception as e:
+                logger.error(f"Telegram bot runtime error: {e}")
+        else:
+            logger.warning("BOT_TOKEN is not configured. Telegram bot disabled.")
+
+    bot_task = asyncio.create_task(background_startup())
+
+    # Yield IMMEDIATELY so uvicorn binds to PORT and passes Render healthcheck in 1s
     yield
 
     if bot_task:
@@ -64,7 +61,10 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     if bot_instance:
-        await bot_instance.session.close()
+        try:
+            await bot_instance.session.close()
+        except Exception:
+            pass
     logger.info("Server shutdown complete.")
 
 app = FastAPI(

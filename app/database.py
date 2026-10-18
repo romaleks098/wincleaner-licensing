@@ -23,19 +23,27 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 async def init_db():
-    for attempt in range(1, 15):
+    global engine, AsyncSessionLocal
+    for attempt in range(1, 6):
         try:
-            logger.info(f"Connecting to database (attempt {attempt}/15)...")
+            logger.info(f"Connecting to database (attempt {attempt}/5)...")
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             logger.info("Database connected and schema initialized.")
             return
         except Exception as e:
             logger.warning(f"Database connection attempt {attempt} failed: {e}")
-            if attempt == 15:
-                logger.error("Could not connect to database after 15 attempts.")
-                raise e
             await asyncio.sleep(2)
+
+    logger.warning("PostgreSQL unavailable — switching to local SQLite fallback database...")
+    try:
+        engine = create_async_engine("sqlite+aiosqlite:///./licensing.db", echo=False)
+        AsyncSessionLocal.configure(bind=engine)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("SQLite fallback database initialized successfully.")
+    except Exception as e:
+        logger.error(f"Fallback SQLite error: {e}")
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
