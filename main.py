@@ -81,10 +81,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "wincleaner-licensing"}
+
 app.include_router(api_router)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", settings.PORT))
+    port = int(os.environ.get("PORT", "10000"))
     logger.info(f"Starting server on 0.0.0.0:{port}...")
     uvicorn.run(
         "main:app",
