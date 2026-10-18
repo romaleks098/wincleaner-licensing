@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -25,8 +26,12 @@ bot_instance = None
 async def lifespan(app: FastAPI):
     global bot_task, bot_instance
     logger.info("Initializing database tables...")
-    await init_db()
-    logger.info("Database initialized successfully.")
+    try:
+        await init_db()
+        logger.info("Database initialized successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+
     logger.info(f"Ed25519 Public Key: {settings.ED25519_PUBLIC_KEY_HEX}")
 
     # Start Telegram bot polling if token provided
@@ -39,6 +44,7 @@ async def lifespan(app: FastAPI):
             async def run_bot():
                 logger.info("Starting Telegram Bot polling...")
                 try:
+                    await bot_instance.delete_webhook(drop_pending_updates=False)
                     await dp.start_polling(bot_instance)
                 except Exception as e:
                     logger.error(f"Telegram bot error: {e}")
@@ -78,9 +84,11 @@ app.add_middleware(
 app.include_router(api_router)
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", settings.PORT))
+    logger.info(f"Starting server on 0.0.0.0:{port}...")
     uvicorn.run(
         "main:app",
-        host=settings.HOST,
-        port=settings.PORT,
+        host="0.0.0.0",
+        port=port,
         reload=False
     )

@@ -1,8 +1,11 @@
+import asyncio
+import logging
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from app.config import settings
 
+logger = logging.getLogger("database")
 Base = declarative_base()
 
 engine = create_async_engine(
@@ -20,8 +23,19 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    for attempt in range(1, 15):
+        try:
+            logger.info(f"Connecting to database (attempt {attempt}/15)...")
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            logger.info("Database connected and schema initialized.")
+            return
+        except Exception as e:
+            logger.warning(f"Database connection attempt {attempt} failed: {e}")
+            if attempt == 15:
+                logger.error("Could not connect to database after 15 attempts.")
+                raise e
+            await asyncio.sleep(2)
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
