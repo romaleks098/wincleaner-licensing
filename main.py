@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
                 dp.include_router(bot_router)
                 logger.info("Starting Telegram Bot polling...")
                 await bot_instance.delete_webhook(drop_pending_updates=False)
-                await dp.start_polling(bot_instance)
+                await dp.start_polling(bot_instance, handle_signals=False)
             except Exception as e:
                 logger.error(f"Telegram bot runtime error: {e}")
         else:
