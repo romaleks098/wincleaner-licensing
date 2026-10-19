@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Net;
@@ -7,6 +8,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -118,15 +120,9 @@ namespace WinCleaner.Licensing
             yBytes[31] &= 0x7F;
 
             BigInteger y = DecodeInt(yBytes, 0, 32);
-            BigInteger xx = Mod((y * y - 1) * Inv(D * y * y + 1, Q), Q);
-            BigInteger x = BigInteger.ModPow(xx, (Q + 3) / 8, Q);
+            BigInteger x = RecoverX(y);
 
-            if (Mod(x * x - xx, Q) != 0)
-            {
-                x = Mod(x * I, Q);
-            }
-
-            if (Mod(x, 2) != sign)
+            if ((x.IsEven ? 0 : 1) != sign)
             {
                 x = Q - x;
             }
@@ -134,15 +130,29 @@ namespace WinCleaner.Licensing
             return new Point(x, y);
         }
 
-        private static BigInteger HashToBigInt(byte[] data)
+        private static byte[] EncodePoint(Point p)
         {
-            using (SHA512 sha512 = SHA512.Create())
+            byte[] yBytes = p.Y.ToByteArray();
+            byte[] result = new byte[32];
+            Array.Copy(yBytes, 0, result, 0, Math.Min(yBytes.Length, 32));
+
+            if (!p.X.IsEven)
             {
-                byte[] hash = sha512.ComputeHash(data);
+                result[31] |= 0x80;
+            }
+
+            return result;
+        }
+
+        private static BigInteger HashToScalar(byte[] data)
+        {
+            using (SHA512 sha = SHA512.Create())
+            {
+                byte[] hash = sha.ComputeHash(data);
                 byte[] buf = new byte[hash.Length + 1];
                 Array.Copy(hash, 0, buf, 0, hash.Length);
                 buf[hash.Length] = 0;
-                return new BigInteger(buf);
+                return Mod(new BigInteger(buf), L);
             }
         }
 
@@ -154,23 +164,27 @@ namespace WinCleaner.Licensing
 
             try
             {
+                Point rPoint = DecodePoint(signature, 0);
                 BigInteger s = DecodeInt(signature, 32, 32);
-                if (s >= L) return false;
 
-                Point a = DecodePoint(publicKey, 0);
-                Point r = DecodePoint(signature, 0);
+                if (s >= L || s < 0) return false;
 
-                byte[] kInput = new byte[32 + 32 + message.Length];
-                Array.Copy(signature, 0, kInput, 0, 32);
-                Array.Copy(publicKey, 0, kInput, 32, 32);
-                Array.Copy(message, 0, kInput, 64, message.Length);
+                Point aPoint = DecodePoint(publicKey, 0);
 
-                BigInteger k = Mod(HashToBigInt(kInput), L);
+                byte[] kData = new byte[32 + 32 + message.Length];
+                Array.Copy(signature, 0, kData, 0, 32);
+                Array.Copy(publicKey, 0, kData, 32, 32);
+                Array.Copy(message, 0, kData, 64, message.Length);
 
-                Point p1 = ScalarMult(BasePoint, s);
-                Point p2 = Edwards(r, ScalarMult(a, k));
+                BigInteger k = HashToScalar(kData);
 
-                return p1.X == p2.X && p1.Y == p2.Y;
+                Point sB = ScalarMult(BasePoint, s);
+                Point rPlusKA = Edwards(rPoint, ScalarMult(aPoint, k));
+
+                Point sB8 = ScalarMult(sB, 8);
+                Point rKA8 = ScalarMult(rPlusKA, 8);
+
+                return sB8.X == rKA8.X && sB8.Y == rKA8.Y;
             }
             catch
             {
@@ -180,40 +194,21 @@ namespace WinCleaner.Licensing
     }
     #endregion
 
-    #region Hardware ID Generator
+    #region Hardware ID Generation
     public static class HardwareId
     {
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
         private static extern bool GetVolumeInformation(
-            string rootPathName,
-            StringBuilder volumeNameBuffer,
-            int volumeNameSize,
-            out uint volumeSerialNumber,
-            out uint maximumComponentLength,
-            out uint fileSystemFlags,
-            StringBuilder fileSystemNameBuffer,
+            string lpRootPathName,
+            StringBuilder lpVolumeNameBuffer,
+            int nVolumeNameSize,
+            out uint lpVolumeSerialNumber,
+            out uint lpMaximumComponentLength,
+            out uint lpFileSystemFlags,
+            StringBuilder lpFileSystemNameBuffer,
             int nFileSystemNameSize);
 
-        public static string GetVolumeSerial()
-        {
-            try
-            {
-                string sysDrive = Path.GetPathRoot(Environment.SystemDirectory);
-                if (string.IsNullOrEmpty(sysDrive)) sysDrive = "C:\\";
-
-                uint serialNumber;
-                uint maxCompLen;
-                uint flags;
-                if (GetVolumeInformation(sysDrive, null, 0, out serialNumber, out maxCompLen, out flags, null, 0))
-                {
-                    return serialNumber.ToString("X8");
-                }
-            }
-            catch { }
-            return "00000000";
-        }
-
-        public static string GetMachineGuid()
+        private static string GetMachineGuid()
         {
             try
             {
@@ -231,21 +226,41 @@ namespace WinCleaner.Licensing
 
             try
             {
-                using (RegistryKey rk = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Cryptography"))
+                using (RegistryKey sub = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Cryptography"))
                 {
-                    if (rk != null)
+                    if (sub != null)
                     {
-                        object val = rk.GetValue("MachineGuid");
+                        object val = sub.GetValue("MachineGuid");
                         if (val != null) return val.ToString().Trim();
                     }
                 }
             }
             catch { }
 
-            return "NO-GUID";
+            return Environment.MachineName;
         }
 
-        public static string GetCpuInfo()
+        private static string GetVolumeSerial()
+        {
+            try
+            {
+                string drive = Path.GetPathRoot(Environment.SystemDirectory);
+                if (string.IsNullOrEmpty(drive)) drive = "C:\\";
+
+                uint serial, maxComp, flags;
+                StringBuilder volName = new StringBuilder(261);
+                StringBuilder fsName = new StringBuilder(261);
+
+                if (GetVolumeInformation(drive, volName, volName.Capacity, out serial, out maxComp, out flags, fsName, fsName.Capacity))
+                {
+                    return serial.ToString("X8");
+                }
+            }
+            catch { }
+            return "00000000";
+        }
+
+        private static string GetCpuInfo()
         {
             try
             {
@@ -284,7 +299,100 @@ namespace WinCleaner.Licensing
     }
     #endregion
 
-    #region License Manager & Storage
+    #region Anti-Debug & Anti-Tamper Security Guard
+    public static class AntiDebug
+    {
+        [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CheckRemoteDebuggerPresent(IntPtr hProcess, [MarshalAs(UnmanagedType.Bool)] ref bool isDebuggerPresent);
+
+        [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsDebuggerPresent();
+
+        private static readonly string[] BlacklistedTools = new string[]
+        {
+            "dnspy", "dnspy-x86", "de4dot", "ilspy", "x64dbg", "x32dbg",
+            "ida", "ida64", "idag", "idag64", "idaw", "idaw64",
+            "cheatengine-x86_64", "cheatengine-i386", "cheatengine",
+            "scylla", "scylla_x64", "scylla_x86", "charles", "fiddler",
+            "httpdebuggerui", "httpdebugger", "wireshark", "processhacker"
+        };
+
+        private static Thread _watchdogThread;
+        private static volatile bool _watchdogStarted = false;
+
+        public static void StartWatchdog()
+        {
+            if (_watchdogStarted) return;
+            _watchdogStarted = true;
+            _watchdogThread = new Thread(WatchdogLoop)
+            {
+                IsBackground = true,
+                Name = "SecWatchdog",
+                Priority = ThreadPriority.Lowest
+            };
+            _watchdogThread.Start();
+        }
+
+        private static void WatchdogLoop()
+        {
+            Random rng = new Random();
+            while (true)
+            {
+                try
+                {
+                    if (CheckDebuggerOrTools())
+                    {
+                        Process.GetCurrentProcess().Kill();
+                        return;
+                    }
+                }
+                catch { }
+
+                Thread.Sleep(rng.Next(3000, 5000));
+            }
+        }
+
+        public static bool CheckDebuggerOrTools()
+        {
+            try
+            {
+                if (Debugger.IsAttached || Debugger.IsLogging())
+                    return true;
+
+                if (IsDebuggerPresent())
+                    return true;
+
+                bool remotePresent = false;
+                CheckRemoteDebuggerPresent(Process.GetCurrentProcess().Handle, ref remotePresent);
+                if (remotePresent)
+                    return true;
+
+                Process[] procs = Process.GetProcesses();
+                for (int i = 0; i < procs.Length; i++)
+                {
+                    try
+                    {
+                        string name = procs[i].ProcessName.ToLowerInvariant();
+                        for (int j = 0; j < BlacklistedTools.Length; j++)
+                        {
+                            if (name == BlacklistedTools[j] || name.Contains(BlacklistedTools[j]))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return false;
+        }
+    }
+    #endregion
+
+    #region License Info & License Guard
     public class LicenseInfo
     {
         public string LicenseKey;
@@ -302,18 +410,98 @@ namespace WinCleaner.Licensing
         }
     }
 
+    public static class LicenseGuard
+    {
+        private static byte[] _sessionToken = null;
+        private static int _guardState = 0;
+        private const int ValidMagic = 0x5A9C3B12;
+
+        public static bool ValidateStartup()
+        {
+            if (AntiDebug.CheckDebuggerOrTools())
+            {
+                Process.GetCurrentProcess().Kill();
+                return false;
+            }
+
+            bool ok = LicenseManager.Validate();
+            if (ok && LicenseManager.CurrentLicense != null)
+            {
+                Initialize(LicenseManager.CurrentLicense);
+                AntiDebug.StartWatchdog();
+                return true;
+            }
+            return false;
+        }
+
+        public static void Initialize(LicenseInfo lic)
+        {
+            if (lic == null || !LicenseManager.VerifySignature(lic))
+            {
+                _sessionToken = null;
+                _guardState = 0;
+                return;
+            }
+
+            try
+            {
+                using (SHA256 sha = SHA256.Create())
+                {
+                    byte[] sigBytes = Convert.FromBase64String(lic.SignatureBase64);
+                    byte[] hwidBytes = Encoding.UTF8.GetBytes(lic.Hwid);
+                    byte[] combined = new byte[sigBytes.Length + hwidBytes.Length + 8];
+                    Buffer.BlockCopy(sigBytes, 0, combined, 0, sigBytes.Length);
+                    Buffer.BlockCopy(hwidBytes, 0, combined, sigBytes.Length, hwidBytes.Length);
+                    byte[] salt = new byte[] { 0x57, 0x69, 0x6E, 0x43, 0x6C, 0x65, 0x61, 0x6E }; // "WinClean"
+                    Buffer.BlockCopy(salt, 0, combined, sigBytes.Length + hwidBytes.Length, 8);
+                    _sessionToken = sha.ComputeHash(combined);
+                }
+                _guardState = ValidMagic;
+            }
+            catch
+            {
+                _sessionToken = null;
+                _guardState = 0;
+            }
+        }
+
+        public static bool IsOperational()
+        {
+            if (_guardState != ValidMagic || _sessionToken == null || _sessionToken.Length != 32)
+                return false;
+
+            if (LicenseManager.CurrentLicense == null)
+                return false;
+
+            if (DateTime.UtcNow > LicenseManager.CurrentLicense.ExpiresAt)
+                return false;
+
+            return true;
+        }
+
+        public static void AssertOperational()
+        {
+            if (AntiDebug.CheckDebuggerOrTools())
+            {
+                Process.GetCurrentProcess().Kill();
+                throw new UnauthorizedAccessException("Security violation");
+            }
+
+            if (!IsOperational())
+            {
+                Process.GetCurrentProcess().Kill();
+                throw new InvalidOperationException("Операция заблокирована: требуется действующая цифровая лицензия WinCleaner.");
+            }
+        }
+    }
+    #endregion
+
+    #region License Manager & Storage
     public static class LicenseManager
     {
-        // Default Server Endpoint - can be customized via environment or config
         public static string ServerUrl = "https://wincleaner-license.onrender.com";
-
-        // Telegram Bot link for purchase / management
         public static string TelegramBotUrl = "https://t.me/WinCleanerLicense_Bot";
-
-        // Server Ed25519 Public Key (32 bytes hex)
         public static readonly string PublicKeyHex = "acba32615e13044a3d15823b07ed600e9384c34b79eab06aa88f8c08fada9457";
-
-        // Maximum offline duration permitted without contacting the server
         public static readonly TimeSpan MaxOfflineGracePeriod = TimeSpan.FromDays(7);
 
         public static LicenseInfo CurrentLicense { get; private set; }
@@ -329,7 +517,6 @@ namespace WinCleaner.Licensing
             try
             {
                 ServicePointManager.Expect100Continue = false;
-                // Explicitly enable TLS 1.3 (12288), TLS 1.2 (3072), TLS 1.1 (768), TLS 1.0 (192)
                 ServicePointManager.SecurityProtocol = (SecurityProtocolType)12288 
                                                      | (SecurityProtocolType)3072 
                                                      | (SecurityProtocolType)768 
@@ -388,6 +575,7 @@ namespace WinCleaner.Licensing
 
                 File.WriteAllBytes(GetLicenseFilePath(), cipher);
                 CurrentLicense = info;
+                LicenseGuard.Initialize(info);
                 return true;
             }
             catch (Exception ex)
@@ -418,6 +606,13 @@ namespace WinCleaner.Licensing
                 info.LastCheckedAt = DateTime.Parse(lines[3].Trim()).ToUniversalTime();
                 info.SignatureBase64 = lines[4].Trim();
 
+                // Anti-Clock-Rollback Detection:
+                if (DateTime.UtcNow < info.LastCheckedAt.AddMinutes(-10))
+                {
+                    LastError = "Обнаружен откат системного времени назад. Проверьте дату и время на компьютере.";
+                    return null;
+                }
+
                 return info;
             }
             catch
@@ -443,7 +638,8 @@ namespace WinCleaner.Licensing
             LicenseInfo lic = LoadLocalLicense();
             if (lic == null)
             {
-                LastError = "Лицензия не найдена на этом компьютере.";
+                if (string.IsNullOrEmpty(LastError))
+                    LastError = "Лицензия не найдена на этом компьютере.";
                 return false;
             }
 
@@ -467,7 +663,6 @@ namespace WinCleaner.Licensing
                 return false;
             }
 
-            // Check if online validation is needed (grace period expired or opportunistic update)
             TimeSpan timeSinceCheck = DateTime.UtcNow - lic.LastCheckedAt;
             if (timeSinceCheck > TimeSpan.FromHours(12))
             {
@@ -480,6 +675,7 @@ namespace WinCleaner.Licensing
             }
 
             CurrentLicense = lic;
+            LicenseGuard.Initialize(lic);
             return true;
         }
 
@@ -495,7 +691,6 @@ namespace WinCleaner.Licensing
                 string resp = HttpPostJson(url, json);
                 if (string.IsNullOrEmpty(resp)) return false;
 
-                // Simple JSON parser for expected response fields
                 string status = ExtractJsonValue(resp, "status");
                 if (status != "active")
                 {
@@ -520,10 +715,7 @@ namespace WinCleaner.Licensing
                     }
                 }
             }
-            catch
-            {
-                // Network unavailable - keep offline grace state
-            }
+            catch { }
             return false;
         }
 
@@ -587,6 +779,7 @@ namespace WinCleaner.Licensing
 
                 SaveLocalLicense(lic);
                 CurrentLicense = lic;
+                LicenseGuard.Initialize(lic);
                 return true;
             }
             catch (WebException wex)
@@ -711,103 +904,96 @@ namespace WinCleaner.Licensing
             this.MinimizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
             this.ClientSize = new Size(520, 310);
-            this.BackColor = Color.FromArgb(24, 24, 37); // Dark theme matching WinCleaner
-            this.ForeColor = Color.FromArgb(205, 214, 244);
+            this.BackColor = Color.FromArgb(10, 12, 24);
+            this.ForeColor = Color.FromArgb(240, 240, 245);
             this.Font = new Font("Segoe UI", 9.5f, FontStyle.Regular);
 
-            // Title
+            try { this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+
             Label lblTitle = new Label();
             lblTitle.Text = "Требуется активация WinCleaner";
             lblTitle.Font = new Font("Segoe UI", 13f, FontStyle.Bold);
-            lblTitle.ForeColor = Color.FromArgb(137, 180, 250);
+            lblTitle.ForeColor = Color.FromArgb(140, 185, 255);
             lblTitle.Location = new Point(20, 16);
             lblTitle.Size = new Size(480, 28);
             this.Controls.Add(lblTitle);
 
-            // HWID Label
             lblHwidHint = new Label();
             lblHwidHint.Text = "Ваш аппаратный идентификатор (HWID):";
             lblHwidHint.Location = new Point(20, 56);
             lblHwidHint.Size = new Size(480, 20);
-            lblHwidHint.ForeColor = Color.FromArgb(166, 173, 200);
+            lblHwidHint.ForeColor = Color.FromArgb(170, 175, 195);
             this.Controls.Add(lblHwidHint);
 
-            // HWID TextBox
             txtHwid = new TextBox();
             txtHwid.ReadOnly = true;
             txtHwid.Location = new Point(20, 80);
             txtHwid.Size = new Size(380, 26);
-            txtHwid.BackColor = Color.FromArgb(17, 17, 27);
-            txtHwid.ForeColor = Color.FromArgb(148, 226, 213);
+            txtHwid.BackColor = Color.FromArgb(18, 20, 36);
+            txtHwid.ForeColor = Color.FromArgb(150, 225, 215);
             txtHwid.Font = new Font("Consolas", 9f);
             txtHwid.Text = HardwareId.GenerateHwid();
             this.Controls.Add(txtHwid);
 
-            // Copy HWID Button
             btnCopyHwid = new Button();
-            btnCopyHwid.Text = "📋 Копировать";
+            btnCopyHwid.Text = "📋 Скопировать";
             btnCopyHwid.Location = new Point(408, 79);
             btnCopyHwid.Size = new Size(92, 28);
             btnCopyHwid.FlatStyle = FlatStyle.Flat;
-            btnCopyHwid.BackColor = Color.FromArgb(49, 50, 68);
-            btnCopyHwid.ForeColor = Color.FromArgb(205, 214, 244);
+            btnCopyHwid.BackColor = Color.FromArgb(35, 40, 65);
+            btnCopyHwid.ForeColor = Color.FromArgb(220, 225, 245);
             btnCopyHwid.Cursor = Cursors.Hand;
             btnCopyHwid.Click += delegate {
-                Clipboard.SetText(txtHwid.Text);
+                try { Clipboard.SetText(txtHwid.Text); } catch { }
                 MessageBox.Show(this, "HWID скопирован в буфер обмена!", "WinCleaner", MessageBoxButtons.OK, MessageBoxIcon.Information);
             };
             this.Controls.Add(btnCopyHwid);
 
-            // License Key Label
             lblKeyHint = new Label();
             lblKeyHint.Text = "Введите лицензионный ключ (WINC-XXXX-XXXX-XXXX):";
             lblKeyHint.Location = new Point(20, 120);
             lblKeyHint.Size = new Size(480, 20);
-            lblKeyHint.ForeColor = Color.FromArgb(166, 173, 200);
+            lblKeyHint.ForeColor = Color.FromArgb(170, 175, 195);
             this.Controls.Add(lblKeyHint);
 
-            // License Key TextBox
             txtKey = new TextBox();
             txtKey.Location = new Point(20, 144);
             txtKey.Size = new Size(480, 26);
-            txtKey.BackColor = Color.FromArgb(17, 17, 27);
+            txtKey.BackColor = Color.FromArgb(18, 20, 36);
             txtKey.ForeColor = Color.White;
             txtKey.Font = new Font("Consolas", 10.5f, FontStyle.Bold);
             this.Controls.Add(txtKey);
 
-            // Status Label
             lblStatus = new Label();
             lblStatus.Location = new Point(20, 180);
             lblStatus.Size = new Size(480, 42);
-            lblStatus.ForeColor = Color.FromArgb(243, 139, 168);
+            lblStatus.ForeColor = Color.FromArgb(250, 130, 140);
             if (!string.IsNullOrEmpty(LicenseManager.LastError))
             {
                 lblStatus.Text = LicenseManager.LastError;
             }
             this.Controls.Add(lblStatus);
 
-            // Telegram Button
             btnTelegram = new Button();
             btnTelegram.Text = "✈ Купить в Telegram";
             btnTelegram.Location = new Point(20, 245);
             btnTelegram.Size = new Size(180, 36);
             btnTelegram.FlatStyle = FlatStyle.Flat;
-            btnTelegram.BackColor = Color.FromArgb(49, 50, 68);
-            btnTelegram.ForeColor = Color.FromArgb(137, 180, 250);
+            btnTelegram.BackColor = Color.FromArgb(35, 40, 65);
+            btnTelegram.ForeColor = Color.FromArgb(140, 185, 255);
             btnTelegram.Cursor = Cursors.Hand;
             btnTelegram.Click += delegate {
-                try { System.Diagnostics.Process.Start(LicenseManager.TelegramBotUrl); } catch { }
+                try { Process.Start(LicenseManager.TelegramBotUrl); } catch { }
             };
             this.Controls.Add(btnTelegram);
 
-            // Activate Button
             btnActivate = new Button();
             btnActivate.Text = "⚡ Активировать";
             btnActivate.Location = new Point(340, 245);
             btnActivate.Size = new Size(160, 36);
             btnActivate.FlatStyle = FlatStyle.Flat;
-            btnActivate.BackColor = Color.FromArgb(137, 180, 250);
-            btnActivate.ForeColor = Color.FromArgb(17, 17, 27);
+            btnActivate.BackColor = Color.FromArgb(140, 185, 255);
+            btnActivate.ForeColor = Color.FromArgb(10, 12, 24);
             btnActivate.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
             btnActivate.Cursor = Cursors.Hand;
             btnActivate.Click += OnActivateClick;
@@ -819,21 +1005,21 @@ namespace WinCleaner.Licensing
             string key = txtKey.Text.Trim();
             if (string.IsNullOrEmpty(key))
             {
-                lblStatus.ForeColor = Color.FromArgb(243, 139, 168);
-                lblStatus.Text = "Пожалуйста, введите ключ.";
+                lblStatus.ForeColor = Color.FromArgb(250, 130, 140);
+                lblStatus.Text = "Пожалуйста, введите лицензионный ключ.";
                 return;
             }
 
             btnActivate.Enabled = false;
             btnActivate.Text = "Проверка...";
-            lblStatus.ForeColor = Color.FromArgb(137, 180, 250);
-            lblStatus.Text = "Связь с сервером лицензирования...";
+            lblStatus.ForeColor = Color.FromArgb(140, 185, 255);
+            lblStatus.Text = "Проверка лицензии на сервере...";
             this.Refresh();
 
             bool ok = LicenseManager.Activate(key);
             if (ok)
             {
-                lblStatus.ForeColor = Color.FromArgb(166, 227, 161);
+                lblStatus.ForeColor = Color.FromArgb(130, 230, 150);
                 lblStatus.Text = "Лицензия успешно активирована до: " + LicenseManager.CurrentLicense.ExpiresAt.ToLocalTime().ToString("dd.MM.yyyy");
                 IsSuccess = true;
                 MessageBox.Show(this, "Лицензия успешно активирована!\n\nДействует до: " + LicenseManager.CurrentLicense.ExpiresAt.ToLocalTime().ToString("dd.MM.yyyy"), "Успех", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -842,7 +1028,7 @@ namespace WinCleaner.Licensing
             }
             else
             {
-                lblStatus.ForeColor = Color.FromArgb(243, 139, 168);
+                lblStatus.ForeColor = Color.FromArgb(250, 130, 140);
                 lblStatus.Text = LicenseManager.LastError ?? "Ошибка активации ключа.";
                 btnActivate.Enabled = true;
                 btnActivate.Text = "⚡ Активировать";
