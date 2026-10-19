@@ -118,6 +118,11 @@ cmd.exe /c build.bat
    ```
 3. Render отслеживает коммиты в `main` и запускает автодеплой за 1.5–2 минуты.
 
+### Защита от засыпания (Anti-Sleep & Keep-Alive)
+- На бесплатном тарифе Render сервис засыпает после 15 минут отсутствия входящих запросов.
+- В `main.py` работает фоновый таск `run_keep_alive()`, отправляющий GET на `https://wincleaner-license.onrender.com/api/v1/health` каждые 8 минут.
+- Для 100% гарантии (пробуждение после перезапуска хоста) подключен внешний HTTP пинг через `cron-job.org` / `uptimerobot.com`.
+
 ### Мониторинг статуса Render и логов через Python
 ```python
 import urllib.request, json
