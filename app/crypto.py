@@ -39,3 +39,12 @@ def verify_license_signature(license_key: str, hwid: str, expires_at: datetime, 
         return True
     except Exception:
         return False
+
+def generate_key_string() -> str:
+    import secrets
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    parts = ["WINC"]
+    for _ in range(3):
+        parts.append("".join(secrets.choice(alphabet) for _ in range(4)))
+    return "-".join(parts)
+

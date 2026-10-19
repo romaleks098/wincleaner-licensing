@@ -75,6 +75,8 @@ async def run_bot_polling():
 
     global bot_instance
     bot_instance = Bot(token=settings.BOT_TOKEN)
+    from app.bot import set_bot_instance
+    set_bot_instance(bot_instance)
     dp = Dispatcher()
     dp.include_router(bot_router)
 

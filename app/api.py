@@ -1,3 +1,4 @@
+import asyncio
 import time
 import secrets
 import string
@@ -18,7 +19,8 @@ from app.schemas import (
     DeactivateRequest, DeactivateResponse,
     AdminGenerateKeyRequest, AdminRevokeRequest, AdminExtendRequest
 )
-from app.crypto import sign_license
+from app.crypto import sign_license, generate_key_string
+from app.bot import send_admin_alert, escape_html
 
 router = APIRouter(prefix="/api/v1", tags=["licensing"])
 
@@ -34,6 +36,10 @@ def check_rate_limit(request: Request):
     # Prune old timestamps
     _rate_limits[client_ip] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
     if len(_rate_limits[client_ip]) >= RATE_LIMIT_MAX_REQUESTS:
+        asyncio.create_task(send_admin_alert(
+            f"⛔ <b>Превышен Rate-Limit (возможный брутфорс)!</b>\n"
+            f"🌐 IP: <code>{client_ip}</code> заблокирован на 60 сек."
+        ))
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Слишком много запросов. Пожалуйста, подождите минуту."
@@ -41,18 +47,11 @@ def check_rate_limit(request: Request):
     _rate_limits[client_ip].append(now)
 
 def verify_admin_token(x_admin_token: Optional[str] = Header(None)):
-    if not x_admin_token or x_admin_token.strip() != settings.ADMIN_SECRET:
+    if not x_admin_token or not secrets.compare_digest(x_admin_token.strip(), settings.ADMIN_SECRET):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Неверный токен администратора."
         )
-
-def generate_key_string() -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    parts = ["WINC"]
-    for _ in range(3):
-        parts.append("".join(secrets.choice(alphabet) for _ in range(4)))
-    return "-".join(parts)
 
 @router.get("/health")
 async def health_check():
@@ -82,12 +81,26 @@ async def activate_license(
         log = ActivationLog(license_id=None, hwid=hwid, action="activate", ip_address=client_ip, success=False, details="Ключ не найден")
         db.add(log)
         await db.commit()
+        asyncio.create_task(send_admin_alert(
+            f"⚠️ <b>Попытка активации неверного ключа!</b>\n\n"
+            f"🔑 Введен ключ: <code>{escape_html(key)}</code>\n"
+            f"💻 ПК: <b>{escape_html(req.device_name)}</b>\n"
+            f"🆔 HWID: <code>{escape_html(hwid[:16])}...</code>\n"
+            f"🌐 IP: <code>{client_ip}</code>"
+        ))
         raise HTTPException(status_code=404, detail="Лицензионный ключ не найден. Проверьте правильность ввода.")
 
     if lic.status == "revoked":
         log = ActivationLog(license_id=lic.id, hwid=hwid, action="activate", ip_address=client_ip, success=False, details="Лицензия отозвана")
         db.add(log)
         await db.commit()
+        asyncio.create_task(send_admin_alert(
+            f"🚫 <b>Попытка активации отозванного ключа!</b>\n\n"
+            f"🔑 Ключ: <code>{escape_html(key)}</code>\n"
+            f"💻 ПК: <b>{escape_html(req.device_name)}</b>\n"
+            f"🆔 HWID: <code>{escape_html(hwid[:16])}...</code>\n"
+            f"🌐 IP: <code>{client_ip}</code>"
+        ))
         raise HTTPException(status_code=403, detail="Данная лицензия отозвана администратором.")
 
     now = datetime.utcnow()
@@ -97,6 +110,12 @@ async def activate_license(
         log = ActivationLog(license_id=lic.id, hwid=hwid, action="activate", ip_address=client_ip, success=False, details="Срок действия истек")
         db.add(log)
         await db.commit()
+        asyncio.create_task(send_admin_alert(
+            f"⏰ <b>Попытка активации просроченного ключа!</b>\n\n"
+            f"🔑 Ключ: <code>{escape_html(key)}</code>\n"
+            f"📅 Истек: {lic.expires_at.strftime('%d.%m.%Y')}\n"
+            f"🌐 IP: <code>{client_ip}</code>"
+        ))
         raise HTTPException(status_code=403, detail=f"Срок действия лицензии истек {lic.expires_at.strftime('%d.%m.%Y')}.")
 
     # Check active devices for this license
@@ -116,6 +135,14 @@ async def activate_license(
             )
             db.add(log)
             await db.commit()
+            asyncio.create_task(send_admin_alert(
+                f"🚨 <b>Превышен лимит устройств для ключа!</b>\n\n"
+                f"🔑 Ключ: <code>{escape_html(key)}</code>\n"
+                f"💻 Попытка с ПК: <b>{escape_html(req.device_name)}</b>\n"
+                f"🆔 HWID: <code>{escape_html(hwid[:16])}...</code>\n"
+                f"🌐 IP: <code>{client_ip}</code>\n"
+                f"Лимит: <b>{len(active_devices)}/{lic.max_devices} ПК</b>"
+            ))
             raise HTTPException(
                 status_code=403,
                 detail=f"Лимит устройств для этой лицензии исчерпан ({lic.max_devices} ПК). Отвяжите старое устройство в Telegram-боте."
@@ -136,6 +163,17 @@ async def activate_license(
     await db.commit()
 
     signature = sign_license(lic.license_key, hwid, lic.expires_at)
+
+    current_dev_count = len(active_devices) + (0 if existing_dev else 1)
+    asyncio.create_task(send_admin_alert(
+        f"🛡️ <b>Успешная активация WinCleaner!</b>\n\n"
+        f"🔑 Ключ: <code>{escape_html(lic.license_key)}</code>\n"
+        f"💻 ПК: <b>{escape_html(req.device_name)}</b>\n"
+        f"🆔 HWID: <code>{escape_html(hwid[:16])}...{escape_html(hwid[-8:])}</code>\n"
+        f"🌐 IP: <code>{client_ip}</code>\n"
+        f"📅 Срок: до <b>{lic.expires_at.strftime('%d.%m.%Y')}</b>\n"
+        f"📱 Устройств: <b>{current_dev_count}/{lic.max_devices}</b>"
+    ))
 
     return ActivationResponse(
         status="active",
