@@ -15,6 +15,13 @@ from app.api import generate_key_string
 logger = logging.getLogger("telegram_bot")
 router = Router()
 
+def escape_md(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    for ch in ["_", "*", "`", "["]:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -45,8 +52,9 @@ async def cmd_start(message: Message):
             user.first_name = first_name
             await db.commit()
 
+    safe_name = escape_md(first_name) or "пользователь"
     welcome_text = (
-        f"👋 Привет, {first_name or 'пользователь'}!\n\n"
+        f"👋 Привет, {safe_name}!\n\n"
         "Добро пожаловать в центр управления лицензиями **WinCleaner**.\n\n"
         "Используйте кнопки меню ниже для управления вашими ключами и устройствами."
     )
@@ -145,8 +153,9 @@ async def handle_my_devices(message: Message):
 
         text_lines = ["💻 **Привязанные устройства:**\n"]
         for d in devices:
+            safe_dev_name = escape_md(d.device_name)
             text_lines.append(
-                f"• **{d.device_name}**\n"
+                f"• **{safe_dev_name}**\n"
                 f"  HWID: `{d.hwid[:16]}...`\n"
                 f"  Последняя активность: `{d.last_seen.strftime('%d.%m.%Y %H:%M')}` UTC\n"
             )
@@ -321,3 +330,11 @@ async def cmd_stats(message: Message):
         f"💻 Активных устройств: `{active_devices}`"
     )
     await message.answer(stats_text, parse_mode="Markdown")
+
+@router.message()
+async def handle_unknown_message(message: Message):
+    text = (
+        "❓ Не удалось распознать команду.\n\n"
+        "Пожалуйста, используйте кнопки меню ниже для управления лицензиями WinCleaner:"
+    )
+    await message.answer(text, reply_markup=get_main_keyboard())
