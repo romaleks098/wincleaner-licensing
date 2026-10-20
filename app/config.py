@@ -2,8 +2,15 @@ import os
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_SERVER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ENV_FILE = os.path.join(_SERVER_DIR, ".env")
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="allow")
+    model_config = SettingsConfigDict(
+        env_file=(_ENV_FILE, ".env"),
+        env_file_encoding="utf-8",
+        extra="allow"
+    )
 
     HOST: str = "0.0.0.0"
     PORT: int = 8000
