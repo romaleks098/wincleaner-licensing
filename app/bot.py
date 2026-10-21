@@ -1,8 +1,10 @@
 import os
 import asyncio
 import logging
+import secrets
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Set
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
@@ -13,13 +15,19 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     FSInputFile,
+    PreCheckoutQuery,
+    LabeledPrice,
+    SuccessfulPayment,
 )
 from aiogram.filters import CommandStart, Command
 from sqlalchemy import select, func, desc, update
 
 from app.config import settings
 from app.database import AsyncSessionLocal
-from app.models import User, License, Device, ActivationLog, SupportTicket, TicketMessage
+from app.models import (
+    User, License, Device, ActivationLog, SupportTicket, TicketMessage,
+    PromoCode, Order, ReferralHistory
+)
 from app.crypto import generate_key_string
 
 logger = logging.getLogger("telegram_bot")
@@ -34,6 +42,20 @@ _admin_reply_map: Dict[int, Tuple[int, int]] = {}
 
 # In-memory state: admin_id -> target_user_id for pending interactive text reply
 _admin_waiting_reply: Dict[int, int] = {}
+
+# In-memory state: user_id -> waiting to enter promo code
+_user_waiting_promo: Set[int] = set()
+
+# In-memory state: user_id -> active promo details (e.g. {"code": "START20", "discount_percent": 20})
+_user_active_promo: Dict[int, Dict] = {}
+
+# In-memory state: admin_id -> waiting for broadcast announcement text
+_admin_waiting_announce: Set[int] = set()
+
+# Standard catalog pricing (RUB and Telegram Stars)
+BASE_PRICES = {"month": 299, "year": 990, "lifetime": 1990, "hwid": 150}
+STARS_PRICES = {"month": 150, "year": 500, "lifetime": 990, "hwid": 75}
+REFERRAL_PERCENT = 15  # 15% cashback for referrers
 
 # Flood protection: user_id -> list of timestamps
 _user_flood_tracker: Dict[int, List[float]] = {}
@@ -192,10 +214,12 @@ async def send_admin_alert(
 # ===========================================================================
 
 def get_main_keyboard(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
-    """Generates the main reply menu buttons."""
+    """Generates the main reply menu buttons with full business & self-service suite."""
     rows = [
         [KeyboardButton(text="🔑 Моя лицензия"), KeyboardButton(text="💳 Купить лицензию")],
         [KeyboardButton(text="💻 Мои устройства"), KeyboardButton(text="🔄 Перенести лицензию")],
+        [KeyboardButton(text="🤝 Партнерка"), KeyboardButton(text="🎟 Промокод")],
+        [KeyboardButton(text="❓ FAQ & Помощь"), KeyboardButton(text="📢 Что нового")],
         [KeyboardButton(text="⚡ Как активировать"), KeyboardButton(text="💬 Поддержка")]
     ]
     if is_admin_user:
@@ -203,22 +227,81 @@ def get_main_keyboard(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def get_tariffs_inline_keyboard() -> InlineKeyboardMarkup:
-    """Tariff selection keyboard with pricing, HWID reset, and direct booking."""
+def get_tariffs_inline_keyboard(discount_percent: int = 0) -> InlineKeyboardMarkup:
+    """Tariff selection keyboard with optional promo discount and 150 RUB HWID reset."""
+    def apply_disc(base: int) -> int:
+        if discount_percent > 0:
+            return max(1, int(base * (100 - discount_percent) / 100))
+        return base
+
+    p_month = apply_disc(299)
+    p_year = apply_disc(990)
+    p_life = apply_disc(1990)
+    p_hwid = 150  # fixed price for HWID unbind
+
+    tag = f" (-{discount_percent}%)" if discount_percent > 0 else ""
+
+    promo_btn_text = f"✅ Скидка {discount_percent}% активна!" if discount_percent > 0 else "🎟 Ввести промокод"
+
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🌟 1 месяц — 299 ₽", callback_data="buy_tariff:month:299"),
-            InlineKeyboardButton(text="🚀 1 год — 990 ₽ (Хит)", callback_data="buy_tariff:year:990")
+            InlineKeyboardButton(text=f"🌟 1 месяц — {p_month} ₽{tag}", callback_data=f"buy_tariff:month:{p_month}"),
+            InlineKeyboardButton(text=f"🚀 1 год — {p_year} ₽ (Хит){tag}", callback_data=f"buy_tariff:year:{p_year}")
         ],
         [
-            InlineKeyboardButton(text="👑 Lifetime (Навсегда) — 1 990 ₽", callback_data="buy_tariff:lifetime:1990")
+            InlineKeyboardButton(text=f"👑 Lifetime (Навсегда) — {p_life} ₽{tag}", callback_data=f"buy_tariff:lifetime:{p_life}")
         ],
         [
-            InlineKeyboardButton(text="🔄 Сброс HWID / Перенос ПК — 150 ₽", callback_data="buy_tariff:hwid:150")
+            InlineKeyboardButton(text=f"🔄 Сброс HWID / Перенос ПК — {p_hwid} ₽", callback_data=f"buy_tariff:hwid:{p_hwid}")
         ],
         [
-            InlineKeyboardButton(text="💬 Задать вопрос по оплате / Другие способы", callback_data="user_open_support_buy")
+            InlineKeyboardButton(text=promo_btn_text, callback_data="user_enter_promo"),
+            InlineKeyboardButton(text="💬 Другие способы", callback_data="user_open_support_buy")
         ]
+    ])
+
+
+def get_payment_methods_keyboard(order_id: str, item_type: str, price_rub: int, stars_amount: int) -> InlineKeyboardMarkup:
+    """Renders selectable payment methods for an order."""
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"⭐ Telegram Stars ({stars_amount} ⭐)",
+                callback_data=f"pay_stars:{order_id}:{item_type}:{stars_amount}:{price_rub}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"💰 Оплатить с баланса ({price_rub} ₽)",
+                callback_data=f"pay_balance:{order_id}:{item_type}:{price_rub}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"💳 СБП / Карты РФ ({price_rub} ₽)",
+                callback_data=f"pay_sbp:{order_id}:{item_type}:{price_rub}"
+            ),
+            InlineKeyboardButton(
+                text="💎 CryptoBot (USDT/TON)",
+                callback_data=f"pay_crypto:{order_id}:{item_type}:{price_rub}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Отмена", callback_data="nav_tariffs")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_faq_inline_keyboard() -> InlineKeyboardMarkup:
+    """Interactive Knowledge Base / FAQ topics."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡️ Антивирус / Windows Defender", callback_data="faq_item:antivirus")],
+        [InlineKeyboardButton(text="⚡ Руководство по глубокой очистке", callback_data="faq_item:cleaning")],
+        [InlineKeyboardButton(text="🔄 Смена ПК и сброс HWID (150 ₽)", callback_data="faq_item:hwid")],
+        [InlineKeyboardButton(text="🔑 Вопросы по ключам и активации", callback_data="faq_item:keys")],
+        [InlineKeyboardButton(text="⚙️ Ошибки и их быстрое решение", callback_data="faq_item:errors")],
+        [InlineKeyboardButton(text="✍️ Задать вопрос поддержке 24/7", callback_data="user_start_ticket")]
     ])
 
 
@@ -227,7 +310,7 @@ def get_support_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✍️ Написать оператору поддержки", callback_data="user_start_ticket"),
-            InlineKeyboardButton(text="❓ Частые вопросы (FAQ)", callback_data="user_faq")
+            InlineKeyboardButton(text="❓ База знаний (FAQ)", callback_data="user_faq")
         ],
         [
             InlineKeyboardButton(text="💳 Оформить покупку", callback_data="nav_tariffs")
@@ -239,18 +322,20 @@ def get_admin_inline_keyboard() -> InlineKeyboardMarkup:
     """Generates interactive inline keyboard for instant 1-click admin actions."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="⚡ Ключ на 30 дней", callback_data="admin_gen_30"),
-            InlineKeyboardButton(text="⚡ Ключ на 1 год", callback_data="admin_gen_365")
+            InlineKeyboardButton(text="⚡ Ключ 30д", callback_data="admin_gen_30"),
+            InlineKeyboardButton(text="⚡ Ключ 1 год", callback_data="admin_gen_365"),
+            InlineKeyboardButton(text="♾️ Lifetime", callback_data="admin_gen_life")
         ],
         [
-            InlineKeyboardButton(text="♾️ Lifetime (навсегда)", callback_data="admin_gen_life"),
-            InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")
+            InlineKeyboardButton(text="📊 Бизнес-аналитика", callback_data="admin_analytics"),
+            InlineKeyboardButton(text="📈 Базовая статистика", callback_data="admin_stats")
         ],
         [
-            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users"),
-            InlineKeyboardButton(text="📜 Логи безопасности", callback_data="admin_logs")
+            InlineKeyboardButton(text="🎟 Промокоды", callback_data="admin_promos_list"),
+            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")
         ],
         [
+            InlineKeyboardButton(text="📜 Логи безопасности", callback_data="admin_logs"),
             InlineKeyboardButton(text="🔄 Обновить панель", callback_data="admin_panel_refresh")
         ]
     ])
@@ -274,33 +359,42 @@ async def build_admin_panel_text(admin_name: str, admin_id: int, db) -> str:
     open_tickets = (await db.execute(
         select(func.count(SupportTicket.id)).where(SupportTicket.status == "open")
     )).scalar() or 0
+    total_rev = (await db.execute(
+        select(func.coalesce(func.sum(Order.amount_rub), 0)).where(Order.status == "paid")
+    )).scalar() or 0
+    active_promos = (await db.execute(
+        select(func.count(PromoCode.id)).where(PromoCode.is_active == True)
+    )).scalar() or 0
 
     return (
         "🛡️ <b>ПАНЕЛЬ АДМИНИСТРАТОРА WinCleaner</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👑 <b>Администратор:</b> {escape_html(admin_name)} (<code>{admin_id}</code>)\n"
+        f"💰 <b>Выручка:</b> <b>{total_rev:,} ₽</b> | 🎟 <b>Промокодов:</b> <b>{active_promos}</b>\n"
         f"📊 <b>Сводка:</b> 👥 Клиентов: <b>{total_users}</b> | 🔑 Ключей: <b>{active_licenses}/{total_licenses}</b> | 💻 ПК: <b>{active_devices}</b>\n"
-        f"📩 <b>Открытых обращений в саппорт:</b> <b>{open_tickets}</b>\n"
+        f"📩 <b>Открытых тикетов в саппорт:</b> <b>{open_tickets}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📋 <b>УПРАВЛЕНИЕ И КОМАНДЫ:</b>\n\n"
+        "📊 <b>Финансы и бизнес:</b>\n"
+        "• <code>/analytics</code> или <code>/finance</code> — Детальная выручка (24ч, 7д, 30д), CR, рефералы\n"
+        "• <code>/createpromo &lt;КОД&gt; &lt;СКИДКА%&gt; [ЛИМИТ]</code> — Создать промокод со скидкой\n"
+        "• <code>/promos</code> — Список всех промокодов системы\n\n"
         "💬 <b>Анонимная поддержка и связь:</b>\n"
         "• <i>Просто ответьте (Reply) на любое сообщение тикета</i> — бот сам передаст ваш ответ клиенту!\n"
         "• <code>/reply &lt;tg_id&gt; &lt;текст&gt;</code> — Написать клиенту от лица бота\n"
         "• <code>/sendkey &lt;tg_id&gt; &lt;дни&gt; [ПК] [заметка]</code> — Выдать ключ и сразу доставить в ЛС\n"
-        "• <code>/user &lt;tg_id&gt;</code> — Полное досье клиента (ключи, HWID, логи)\n"
+        "• <code>/user &lt;tg_id&gt;</code> — Полное досье клиента (ключи, HWID, баланс)\n"
         "• <code>/ban &lt;tg_id&gt;</code> и <code>/unban &lt;tg_id&gt;</code> — Блокировка спамеров\n\n"
         "🔑 <b>Управление лицензиями:</b>\n"
         "• <code>/genkey &lt;дни&gt; [tg_id] [устройств]</code> — Выпустить ключ без отправки\n"
         "• <code>/info &lt;ключ&gt;</code> — Досье ключа, статус и привязанные ПК\n"
         "• <code>/extend &lt;ключ&gt; &lt;дни&gt;</code> — Продлить ключ на N дней\n"
         "• <code>/unbind &lt;ключ&gt;</code> — Сбросить привязку всех ПК ключа\n"
-        "• <code>/revoke &lt;ключ&gt;</code> — Отозвать лицензию навсегда\n"
-        "• <code>/devices &lt;ключ&gt;</code> — Список ПК ключа с HWID\n\n"
-        "📈 <b>Аудит и рассылка:</b>\n"
-        "• <code>/stats</code> — Детальная статистика базы\n"
-        "• <code>/logs</code> — Журнал последних активаций и событий\n"
-        "• <code>/users</code> — Список последних пользователей\n"
-        "• <code>/broadcast &lt;текст&gt;</code> — Рассылка всем клиентам\n\n"
+        "• <code>/revoke &lt;ключ&gt;</code> — Отозвать лицензию навсегда\n\n"
+        "📢 <b>Рассылка и retention:</b>\n"
+        "• <code>/announce &lt;текст&gt;</code> — Официальный анонс обновления всем клиентам\n"
+        "• <code>/broadcast &lt;текст&gt;</code> — Обычная рассылка\n"
+        "• <code>/check_expirations</code> — Ручной запуск проверки истекающих ключей\n\n"
         "⚡ <i>Быстрые действия доступны на кнопках ниже:</i>"
     )
 
@@ -327,13 +421,45 @@ async def cmd_start(message: Message):
         await message.answer("⛔ Доступ к сервису заблокирован.")
         return
 
+    # Check referral param: /start ref_<tg_id>
+    ref_tg_id = None
+    if message.text:
+        cmd_parts = message.text.split(maxsplit=1)
+        if len(cmd_parts) > 1 and cmd_parts[1].startswith("ref_"):
+            raw_ref = cmd_parts[1].replace("ref_", "").strip()
+            if raw_ref.isdigit():
+                ref_tg_id = int(raw_ref)
+
     async with AsyncSessionLocal() as db:
         stmt = select(User).where(User.telegram_id == tg_id)
         res = await db.execute(stmt)
         user = res.scalar_one_or_none()
 
         if not user:
-            user = User(telegram_id=tg_id, username=username, first_name=first_name)
+            referrer_db_id = None
+            if ref_tg_id and ref_tg_id != tg_id:
+                ref_user = (await db.execute(select(User).where(User.telegram_id == ref_tg_id))).scalar_one_or_none()
+                if ref_user:
+                    referrer_db_id = ref_user.id
+                    bot = get_bot_instance()
+                    if bot:
+                        try:
+                            await bot.send_message(
+                                ref_tg_id,
+                                f"🤝 <b>Новый реферал!</b> Пользователь <b>{escape_html(first_name or 'Клиент')}</b> зарегистрировался по вашей ссылке.\n"
+                                f"Вам будет начисляться <b>15% кэшбэка</b> со всех его покупок!",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+
+            user = User(
+                telegram_id=tg_id,
+                username=username,
+                first_name=first_name,
+                referrer_id=referrer_db_id,
+                balance=0
+            )
             db.add(user)
             await db.commit()
         else:
@@ -350,10 +476,13 @@ async def cmd_start(message: Message):
         "оптимизации реестра, защиты приватности и ускорения Windows.\n\n"
         "📌 <b>Возможности центра управления:</b>\n"
         "• 🔑 <b>Моя лицензия</b> — просмотр ваших ключей и срока действия\n"
-        "• 💳 <b>Купить лицензию</b> — выбор и заказ тарифа (1 мес, 1 год, Lifetime)\n"
-        "• 💻 <b>Мои устройства</b> — список ваших привязанных ПК\n"
-        "• 🔄 <b>Перенести лицензию</b> — моментальный сброс HWID для нового ПК\n"
-        "• ⚡ <b>Как активировать</b> — пошаговый гид по запуску приложения\n"
+        "• 💳 <b>Купить лицензию</b> — выбор тарифа и моментальная авто-оплата\n"
+        "• 💻 <b>Мои устройства</b> — список ваших привязанных ПК с инфой об ОС\n"
+        "• 🔄 <b>Перенести лицензию</b> — сброс HWID для нового ПК (150 ₽)\n"
+        "• 🤝 <b>Партнерка</b> — зарабатывайте 15% с покупок приглашенных друзей\n"
+        "• 🎟 <b>Промокод</b> — активация персональной скидки\n"
+        "• ❓ <b>FAQ & Помощь</b> — интерактивная база знаний\n"
+        "• 📢 <b>Что нового</b> — список улучшений в версии v2.0 PRO\n"
         "• 💬 <b>Поддержка</b> — анонимный диалог со специалистом прямо здесь!\n\n"
         "Используйте кнопки меню ниже для навигации ⬇️"
     )
@@ -458,8 +587,13 @@ async def handle_buy_license(message: Message):
     if await check_user_banned(message.from_user.id):
         return
 
+    user_promo = _user_active_promo.get(message.from_user.id)
+    discount_pct = user_promo.get("discount_percent", 0) if user_promo else 0
+    promo_badge = f"🎟 <b>Активирован промокод {user_promo['code']} (-{discount_pct}%)!</b>\n" if discount_pct > 0 else ""
+
     text = (
         "💳 <b>Официальные тарифные планы WinCleaner:</b>\n\n"
+        f"{promo_badge}"
         "• 🌟 <b>1 месяц — 299 ₽</b> (1 ПК)\n"
         "  └ Быстрый старт, полная очистка реестра, кэша и следов телеметрии.\n\n"
         "• 🚀 <b>1 год — 990 ₽</b> (1 ПК) — 🔥 <b>ХИТ ПРОДАЖ! (Экономия 72%)</b>\n"
@@ -471,6 +605,7 @@ async def handle_buy_license(message: Message):
         "✨ <b>В каждый тариф входит:</b>\n"
         "✅ Удаление всего системного мусора и следов шпионажа\n"
         "✅ Оптимизация сети, пинга и оперативной памяти\n"
+        "✅ Моментальная автоматическая выдача ключа сразу после оплаты\n"
         "✅ Полная техническая поддержка 24/7 прямо в этом боте\n\n"
         "Выберите желаемый тариф ниже ⬇️"
     )
@@ -479,7 +614,7 @@ async def handle_buy_license(message: Message):
         message,
         settings.banner_tariffs,
         text,
-        reply_markup=get_tariffs_inline_keyboard()
+        reply_markup=get_tariffs_inline_keyboard(discount_pct)
     )
 
 
@@ -489,16 +624,162 @@ async def cb_nav_tariffs(callback: CallbackQuery):
     await handle_buy_license(callback.message)
 
 
+async def execute_successful_purchase(
+    user_id: int,
+    item_type: str,
+    price_rub: int,
+    payment_method: str,
+    order_id: Optional[str] = None
+):
+    """
+    Automated fulfillment:
+    - Auto-issues license key or executes instant HWID unbind
+    - Credits 15% cashback to referrer's balance if user was invited
+    - Sends celebration cards to client and alerts admin
+    """
+    bot = get_bot_instance()
+    async with AsyncSessionLocal() as db:
+        u_res = await db.execute(select(User).where(User.telegram_id == user_id))
+        user = u_res.scalar_one_or_none()
+        if not user:
+            user = User(telegram_id=user_id)
+            db.add(user)
+            await db.flush()
+
+        # 1. Referral Cashback (15%)
+        if user.referrer_id:
+            ref_u = (await db.execute(select(User).where(User.id == user.referrer_id))).scalar_one_or_none()
+            if ref_u:
+                reward = max(1, int(price_rub * (REFERRAL_PERCENT / 100)))
+                ref_u.balance = (ref_u.balance or 0) + reward
+                ref_history = ReferralHistory(
+                    referrer_id=ref_u.id,
+                    referred_id=user.id,
+                    reward_rub=reward
+                )
+                db.add(ref_history)
+                if bot:
+                    try:
+                        await bot.send_message(
+                            ref_u.telegram_id,
+                            f"🎉 <b>Начисление бонуса!</b> Ваш приглашенный друг совершил оплату.\n"
+                            f"💰 На ваш баланс зачислено: <b>+{reward} ₽</b>\n"
+                            f"💳 Доступный баланс: <b>{ref_u.balance} ₽</b> (можно оплатить тариф или сброс HWID)",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+
+        # 2. Fulfillment
+        if "hwid" in item_type:
+            # Unbind devices
+            lic_stmt = select(License).where(License.user_id == user.id, License.status == "active")
+            lic_res = await db.execute(lic_stmt)
+            licenses = lic_res.scalars().all()
+            unbound_count = 0
+            for lic in licenses:
+                dev_stmt = select(Device).where(Device.license_id == lic.id, Device.is_active == True)
+                dev_res = await db.execute(dev_stmt)
+                for d in dev_res.scalars().all():
+                    d.is_active = False
+                    unbound_count += 1
+
+            log = ActivationLog(
+                license_id=None,
+                hwid="PAID_AUTO_HWID",
+                action="transfer",
+                ip_address=payment_method,
+                success=True,
+                details=f"Auto unbind {unbound_count} device(s) via {payment_method}"
+            )
+            db.add(log)
+            await db.commit()
+
+            if bot:
+                confirm_text = (
+                    "🎉 <b>Оплата 150 ₽ успешно получена!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "✅ <b>Привязка HWID моментально сброшена!</b>\n\n"
+                    f"Отвязано активных компьютеров: <b>{unbound_count}</b>.\n"
+                    "Теперь запустите WinCleaner на новом компьютере и вставьте ваш ключ — он активируется без задержек!"
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔑 Моя лицензия", callback_data="nav_my_license")]
+                ])
+                try:
+                    await bot.send_message(user_id, confirm_text, reply_markup=kb, parse_mode="HTML")
+                except Exception:
+                    pass
+
+            await send_admin_alert(
+                f"✅ <b>Авто-оплата сброса HWID (150 ₽)!</b>\n"
+                f"👤 Клиент: <code>{user_id}</code> | Метод: <b>{payment_method}</b>\n"
+                f"Отвязано ПК: <b>{unbound_count}</b>"
+            )
+            return
+
+        else:
+            # Issue License
+            days_map = {"month": 30, "year": 365, "lifetime": 36500}
+            devs_map = {"month": 1, "year": 1, "lifetime": 2}
+            base_type = item_type.replace("tariff_", "").split(":")[0]
+            days = days_map.get(base_type, 30)
+            max_devs = devs_map.get(base_type, 1)
+
+            key = generate_key_string()
+            now = utc_now()
+            exp = now + timedelta(days=days)
+
+            lic = License(
+                license_key=key,
+                user_id=user.id,
+                status="active",
+                max_devices=max_devs,
+                created_at=now,
+                expires_at=exp,
+                notes=f"Auto-issued via {payment_method} ({price_rub} RUB)"
+            )
+            db.add(lic)
+            await db.commit()
+
+            exp_str = "Бессрочно (Lifetime)" if days > 10000 else exp.strftime("%d.%m.%Y")
+            if bot:
+                card = (
+                    "🎉 <b>Оплата успешно подтверждена! Ваша лицензия готова:</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔑 Ваш ключ: <code>{key}</code>\n"
+                    f"📅 Срок действия: <b>{exp_str}</b>\n"
+                    f"💻 Доступно компьютеров: <b>{max_devs} ПК</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "⚡ <b>Как активировать:</b>\n"
+                    "1. Запустите <code>WinCleaner.exe</code> от имени администратора\n"
+                    "2. Скопируйте ключ выше и вставьте в окно активации\n"
+                    "3. Нажмите «⚡ Активировать»!\n\n"
+                    "<i>(Нажмите на ключ выше, чтобы скопировать его в буфер обмена)</i>"
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔑 Моя лицензия", callback_data="nav_my_license")],
+                    [InlineKeyboardButton(text="⚡ Инструкция", callback_data="nav_how_activate")]
+                ])
+                try:
+                    await bot.send_message(user_id, card, reply_markup=kb, parse_mode="HTML")
+                except Exception:
+                    pass
+
+            await send_admin_alert(
+                f"💰 <b>НОВАЯ АВТО-ОПЛАТА ЛИЦЕНЗИИ!</b>\n"
+                f"👤 Клиент: <code>{user_id}</code>\n"
+                f"📦 Тариф: <b>{base_type}</b> ({price_rub} ₽)\n"
+                f"💳 Метод: <b>{payment_method}</b>\n"
+                f"🔑 Выдан ключ: <code>{key}</code>"
+            )
+
+
 @router.callback_query(F.data.startswith("buy_tariff:"))
 async def cb_buy_tariff(callback: CallbackQuery):
-    """
-    User selected a tariff to buy.
-    Registers a purchase inquiry, notifies admins with user details,
-    and shows payment info to user with direct support in bot.
-    """
     parts = callback.data.split(":")
     tariff_code = parts[1]
-    price = parts[2]
+    price = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 299
 
     tariff_titles = {
         "month": "1 месяц (1 ПК)",
@@ -509,121 +790,397 @@ async def cb_buy_tariff(callback: CallbackQuery):
     if tariff_code.startswith("hwid_key_"):
         k = tariff_code.replace("hwid_key_", "")
         tariff_name = f"Сброс HWID для {k}"
+    elif tariff_code.startswith("hwid_"):
+        dev_id = tariff_code.replace("hwid_", "")
+        tariff_name = f"Сброс HWID (ПК #{dev_id})"
     else:
         tariff_name = tariff_titles.get(tariff_code, tariff_code)
 
     user_id = callback.from_user.id
-    user_name = callback.from_user.full_name or "Пользователь"
-    user_uname = f"@{callback.from_user.username}" if callback.from_user.username else "[нет username]"
+    order_id = f"ORD{int(time.time())}{secrets.token_hex(2).upper()}"
 
-    # Record or update support ticket for purchase
+    stars_map = {"month": 150, "year": 500, "lifetime": 990, "hwid": 75}
+    stars_amount = stars_map.get(tariff_code.split("_")[0], 150)
+
+    # Save pending order in DB
     async with AsyncSessionLocal() as db:
         u_res = await db.execute(select(User).where(User.telegram_id == user_id))
         user = u_res.scalar_one_or_none()
-        if not user:
-            user = User(telegram_id=user_id, username=callback.from_user.username, first_name=callback.from_user.first_name)
-            db.add(user)
-            await db.flush()
+        user_balance = user.balance if user else 0
 
-        ticket = SupportTicket(
-            user_id=user.id,
+        ord_record = Order(
+            order_id=order_id,
+            user_id=user.id if user else None,
             user_telegram_id=user_id,
-            status="open",
-            ticket_type="purchase",
-            subject=f"Заказ: {tariff_name} ({price} ₽)"
+            item_type=tariff_code,
+            amount_rub=price,
+            stars_amount=stars_amount,
+            payment_method="pending",
+            status="pending"
         )
-        db.add(ticket)
-        await db.flush()
-
-        msg_record = TicketMessage(
-            ticket_id=ticket.id,
-            sender_type="user",
-            sender_telegram_id=user_id,
-            text=f"Выбран заказ: {tariff_name} за {price} ₽"
-        )
-        db.add(msg_record)
+        db.add(ord_record)
         await db.commit()
-        ticket_id = ticket.id
 
-    is_hwid = "hwid" in tariff_code
-    if is_hwid:
-        admin_alert_text = (
-            "🔄 <b>НОВАЯ ЗАЯВКА НА СБРОС HWID (150 ₽)!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Клиент:</b> {escape_html(user_name)} ({user_uname})\n"
-            f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
-            f"📦 <b>Услуга:</b> <b>{tariff_name}</b>\n"
-            f"💰 <b>Сумма к оплате:</b> <b>150 ₽</b>\n"
-            f"📅 <b>Время:</b> {utc_now().strftime('%d.%m.%Y %H:%M')} UTC\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>После подтверждения оплаты нажмите кнопку сброса ниже:</i>"
-        )
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Сбросить HWID клиенту", callback_data=f"admin_act_unbind_user:{user_id}"),
-                InlineKeyboardButton(text="✍️ Ответить клиенту", callback_data=f"admin_prompt_reply:{user_id}")
-            ],
-            [
-                InlineKeyboardButton(text="👤 Досье клиента", callback_data=f"admin_dossier:{user_id}"),
-                InlineKeyboardButton(text="🔒 Закрыть заявку", callback_data=f"admin_close_ticket:{ticket_id}")
-            ]
-        ])
-    else:
-        days_map = {"month": 30, "year": 365, "lifetime": 36500}
-        devs_map = {"month": 1, "year": 1, "lifetime": 2}
-        issued_days = days_map.get(tariff_code, 30)
-        issued_devs = devs_map.get(tariff_code, 1)
-
-        admin_alert_text = (
-            "🛍️ <b>НОВАЯ ЗАЯВКА НА ПОКУПКУ ЛИЦЕНЗИИ!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Клиент:</b> {escape_html(user_name)} ({user_uname})\n"
-            f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
-            f"📦 <b>Тариф:</b> <b>{tariff_name}</b>\n"
-            f"💰 <b>Сумма к оплате:</b> <b>{price} ₽</b>\n"
-            f"📅 <b>Время заявки:</b> {utc_now().strftime('%d.%m.%Y %H:%M')} UTC\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>Вы можете нажать кнопку ниже для мгновенной выдачи ключа клиенту или ответить текстом:</i>"
-        )
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"⚡ Выдать ключ ({price} ₽)",
-                    callback_data=f"admin_quick_issue:{user_id}:{issued_days}:{issued_devs}"
-                ),
-                InlineKeyboardButton(
-                    text="✍️ Ответить клиенту",
-                    callback_data=f"admin_prompt_reply:{user_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(text="👤 Досье клиента", callback_data=f"admin_dossier:{user_id}"),
-                InlineKeyboardButton(text="🔒 Закрыть заявку", callback_data=f"admin_close_ticket:{ticket_id}")
-            ]
-        ])
-
-    await send_admin_alert(admin_alert_text, reply_markup=admin_kb, ticket_context=(user_id, ticket_id))
-
-    # User confirmation message
-    user_reply = (
-        f"🛍️ <b>Вы выбрали: {tariff_name} — {price} ₽</b>\n\n"
-        "💳 <b>Доступные способы оплаты:</b>\n"
-        "• <b>СБП (Система быстрых платежей) / Перевод на карту</b>\n"
-        "• <b>Криптовалюта (USDT TRC-20, TON, BTC)</b>\n"
-        "• <b>ЮMoney / Любые карты РФ и СНГ</b>\n\n"
-        "💬 <b>Как завершить заказ?</b>\n"
-        "Напишите прямо в этот чат удобный для вас способ оплаты (например: <i>«СБП»</i> или <i>«USDT»</i>), "
-        "либо просто отправьте скриншот чека об оплате.\n\n"
-        "Оператор поддержки ответит вам прямо в этом диалоге и сразу подтвердит выполнение!"
+    text = (
+        f"🛍️ <b>Оформление заказа: {escape_html(tariff_name)}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Сумма к оплате: <b>{price} ₽</b> (или <b>{stars_amount} ⭐ Stars</b>)\n"
+        f"💳 Ваш баланс бонусов: <b>{user_balance} ₽</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚡ <b>Выберите удобный способ оплаты:</b>\n"
+        "• ⭐ <b>Telegram Stars</b> — моментальная оплата в 1 клик прямо в Telegram с авто-выдачей ключа!\n"
+        "• 💰 <b>С баланса бота</b> — оплатите заработанными бонусами от рефералов без реальных денег\n"
+        "• 💳 <b>СБП / Карты РФ</b> — перевод через Систему быстрых платежей или банковскую карту\n"
+        "• 💎 <b>Криптовалюта</b> — оплата через CryptoBot (USDT TRC-20, TON, BTC)\n\n"
+        "<i>Ключ генерируется и отправляется вам сразу после подтверждения оплаты!</i>"
     )
 
-    user_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Написать оператору", callback_data="user_start_ticket")],
+    await callback.message.answer(
+        text,
+        reply_markup=get_payment_methods_keyboard(order_id, tariff_code, price, stars_amount),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pay_stars:"))
+async def cb_pay_stars(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    order_id = parts[1]
+    tariff_code = parts[2]
+    stars_amount = int(parts[3])
+    price_rub = int(parts[4])
+
+    tariff_titles = {
+        "month": "Лицензия 1 месяц (1 ПК)",
+        "year": "Лицензия 1 год (1 ПК)",
+        "lifetime": "Лицензия Lifetime Навсегда (2 ПК)",
+        "hwid": "Сброс привязки HWID (1 ПК)"
+    }
+    title = tariff_titles.get(tariff_code.split("_")[0], "Лицензия WinCleaner")
+
+    try:
+        await callback.message.answer_invoice(
+            title=f"WinCleaner: {title}",
+            description="Официальный ключ WinCleaner 2.0 PRO. Моментальная выдача ключа сразу после оплаты!",
+            payload=f"stars:{order_id}:{tariff_code}:{price_rub}",
+            currency="XTR",
+            prices=[LabeledPrice(label=title, amount=stars_amount)],
+            provider_token=""
+        )
+        await callback.answer("Счет на оплату Stars выставлен!")
+    except Exception as e:
+        logger.error(f"Failed to send Stars invoice: {e}")
+        await callback.answer(f"Ошибка выставления счета: {e}", show_alert=True)
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout_query(query: PreCheckoutQuery):
+    """Pre-checkout validation required by Telegram Stars."""
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    """Handles completed Telegram Stars payment."""
+    payment_info = message.successful_payment
+    payload = payment_info.invoice_payload
+
+    if payload and payload.startswith("stars:"):
+        parts = payload.split(":")
+        order_id = parts[1]
+        tariff_code = parts[2]
+        price_rub = int(parts[3])
+
+        # Mark order paid
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(Order).where(Order.order_id == order_id).values(
+                    status="paid",
+                    payment_method="telegram_stars",
+                    paid_at=utc_now()
+                )
+            )
+            await db.commit()
+
+        # Fulfill
+        await execute_successful_purchase(
+            user_id=message.from_user.id,
+            item_type=tariff_code,
+            price_rub=price_rub,
+            payment_method="Telegram Stars",
+            order_id=order_id
+        )
+
+
+@router.callback_query(F.data.startswith("pay_balance:"))
+async def cb_pay_balance(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    order_id = parts[1]
+    tariff_code = parts[2]
+    price_rub = int(parts[3])
+
+    user_id = callback.from_user.id
+    async with AsyncSessionLocal() as db:
+        u_res = await db.execute(select(User).where(User.telegram_id == user_id))
+        user = u_res.scalar_one_or_none()
+
+        if not user or (user.balance or 0) < price_rub:
+            cur_bal = user.balance if user else 0
+            await callback.answer(
+                f"❌ Недостаточно средств на балансе!\nУ вас: {cur_bal} ₽, нужно: {price_rub} ₽.\n\n"
+                "Приглашайте друзей через раздел «🤝 Партнерка», чтобы заработать на оплату!",
+                show_alert=True
+            )
+            return
+
+        # Deduct balance
+        user.balance -= price_rub
+        await db.execute(
+            update(Order).where(Order.order_id == order_id).values(
+                status="paid",
+                payment_method="balance",
+                paid_at=utc_now()
+            )
+        )
+        await db.commit()
+
+    await callback.answer("✅ Оплата с баланса списана!", show_alert=True)
+    await execute_successful_purchase(
+        user_id=user_id,
+        item_type=tariff_code,
+        price_rub=price_rub,
+        payment_method="Внутренний баланс",
+        order_id=order_id
+    )
+
+
+@router.callback_query(F.data.startswith("pay_sbp:"))
+async def cb_pay_sbp(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    order_id = parts[1]
+    price_rub = int(parts[3])
+
+    text = (
+        f"💳 <b>Оплата через СБП / Карту РФ (Заказ <code>{order_id}</code>)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Сумма к переводу: <b>{price_rub} ₽</b> (ровно)\n\n"
+        "📱 <b>Реквизиты для оплаты:</b>\n"
+        "• СБП / Номер телефона: <code>+7 999 000-00-00</code>\n"
+        "• Банк-получатель: <b>Т-Банк (Тинькофф) / Сбер</b>\n"
+        f"• В комментарии к платежу укажите: <code>{order_id}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💬 <b>Как подтвердить оплату?</b>\n"
+        "Отправьте скриншот чека прямо в этот диалог. Оператор сразу проверит его и подтвердит выдачу ключа!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Отправить чек об оплате", callback_data="user_start_ticket")],
+        [InlineKeyboardButton(text="🔙 Назад к способам оплаты", callback_data="nav_tariffs")]
+    ])
+    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pay_crypto:"))
+async def cb_pay_crypto(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    order_id = parts[1]
+    price_rub = int(parts[3])
+
+    text = (
+        f"💎 <b>Оплата криптовалютой (Заказ <code>{order_id}</code>)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Сумма к оплате: <b>{price_rub} ₽</b> (в эквиваленте USDT/TON)\n\n"
+        "• <b>USDT (TRC-20):</b>\n<code>TWinCleanerOfficialVault999888777</code>\n\n"
+        "• <b>TON (The Open Network):</b>\n<code>EQ_WinCleaner_Official_Ton_Wallet_99</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💬 После отправки прикрепите хэш транзакции или скриншот прямо в этот чат!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Сообщить об оплате", callback_data="user_start_ticket")],
         [InlineKeyboardButton(text="🔙 Назад к тарифам", callback_data="nav_tariffs")]
     ])
+    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
 
-    await callback.message.answer(user_reply, reply_markup=user_kb, parse_mode="HTML")
-    await callback.answer("Заявка принята!")
+
+@router.message(F.text.in_({"🤝 Партнерка", "🤝 Реферальная программа", "/ref", "/partner"}))
+async def handle_partner(message: Message):
+    tg_id = message.from_user.id
+    if await check_user_banned(tg_id):
+        return
+
+    bot_user = settings.BOT_USERNAME or "WinCleanerLicense_Bot"
+    ref_link = f"https://t.me/{bot_user}?start=ref_{tg_id}"
+
+    async with AsyncSessionLocal() as db:
+        u_res = await db.execute(select(User).where(User.telegram_id == tg_id))
+        user = u_res.scalar_one_or_none()
+        if not user:
+            user = User(telegram_id=tg_id, balance=0)
+            db.add(user)
+            await db.commit()
+
+        ref_count = (await db.execute(select(func.count(User.id)).where(User.referrer_id == user.id))).scalar() or 0
+        total_earned = (await db.execute(
+            select(func.coalesce(func.sum(ReferralHistory.reward_rub), 0)).where(ReferralHistory.referrer_id == user.id)
+        )).scalar() or 0
+        cur_balance = user.balance or 0
+
+    text = (
+        "🤝 <b>Партнерская программа WinCleaner («Приведи друга»):</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Делитесь вашей персональной ссылкой с друзьями, в соцсетях и каналах! "
+        f"Вы будете получать <b>{REFERRAL_PERCENT}% кэшбэка</b> с абсолютно каждой покупки вашего реферала!\n\n"
+        f"🔗 <b>Ваша реферальная ссылка:</b>\n"
+        f"<code>{ref_link}</code>\n\n"
+        "📊 <b>Ваша статистика:</b>\n"
+        f"• 👥 Приглашено друзей: <b>{ref_count}</b>\n"
+        f"• 💰 Всего заработано: <b>{total_earned} ₽</b>\n"
+        f"• 💳 Доступный баланс: <b>{cur_balance} ₽</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💡 <i>Накопленные рубли можно тратить на покупку любых лицензий и сброс HWID прямо в боте!</i>"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить тариф с баланса", callback_data="nav_tariffs")],
+        [InlineKeyboardButton(text="🔄 Сброс HWID с баланса (150 ₽)", callback_data="buy_tariff:hwid:150")],
+        [InlineKeyboardButton(text="📤 Запросить вывод в саппорт", callback_data="user_start_ticket")]
+    ])
+
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.message(F.text.in_({"🎟 Промокод", "🎟 Ввести промокод", "/promo"}))
+@router.callback_query(F.data == "user_enter_promo")
+async def handle_promo_menu(event):
+    message = event if isinstance(event, Message) else event.message
+    user_id = event.from_user.id
+    if await check_user_banned(user_id):
+        return
+
+    _user_waiting_promo.add(user_id)
+    active_promo = _user_active_promo.get(user_id)
+
+    status_str = ""
+    if active_promo:
+        status_str = f"✅ У вас уже активен промокод <code>{active_promo['code']}</code> (Скидка <b>{active_promo['discount_percent']}%</b>).\n\n"
+
+    text = (
+        "🎟 <b>Система промокодов WinCleaner:</b>\n\n"
+        f"{status_str}"
+        "Отправьте ваш промокод ответным сообщением в этот чат (например: <code>START20</code> или <code>RENEW10</code>).\n\n"
+        "Скидка моментально применится ко всем тарифам!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="nav_tariffs")]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+
+
+@router.message(F.text.in_({"❓ FAQ & Помощь", "❓ FAQ", "❓ Частые вопросы", "/faq"}))
+@router.callback_query(F.data == "user_faq")
+async def handle_faq_menu(event):
+    message = event if isinstance(event, Message) else event.message
+    text = (
+        "❓ <b>Интерактивная база знаний WinCleaner:</b>\n\n"
+        "Выберите интересующий вас вопрос ниже, чтобы мгновенно получить подробный ответ специалиста:"
+    )
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.message.edit_text(text, reply_markup=get_faq_inline_keyboard(), parse_mode="HTML")
+        except Exception:
+            await event.message.answer(text, reply_markup=get_faq_inline_keyboard(), parse_mode="HTML")
+        await event.answer()
+    else:
+        await message.answer(text, reply_markup=get_faq_inline_keyboard(), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("faq_item:"))
+async def cb_faq_item(callback: CallbackQuery):
+    topic = callback.data.split(":")[1]
+    answers = {
+        "antivirus": (
+            "🛡️ <b>Почему Windows Defender или антивирус ругается на WinCleaner?</b>\n\n"
+            "WinCleaner выполняет глубокую очистку реестра, останавливает скрытые службы слежки Microsoft "
+            "и настраивает сетевые интерфейсы на уровне ядра Windows.\n\n"
+            "Поскольку программа взаимодействует с системными ветками реестра (HKLM/HKCU), антивирусы могут выдать "
+            "ложное срабатывание (False Positive).\n\n"
+            "✅ <b>Решение:</b>\n"
+            "1. Запускайте <code>WinCleaner.exe</code> от имени администратора.\n"
+            "2. Добавьте папку программы в исключения Windows Defender (Защита от вирусов ➔ Исключения)."
+        ),
+        "cleaning": (
+            "⚡ <b>Как правильно запускать глубокую очистку?</b>\n\n"
+            "1. Закройте все браузеры и игры перед началом очистки, чтобы освободить кэш-файлы.\n"
+            "2. Нажмите «Полное сканирование» в главном окне WinCleaner.\n"
+            "3. После анализа нажмите «Очистить и ускорить».\n"
+            "4. Для применения сетевых твиков и очистки ядра рекомендуется перезагрузить компьютер."
+        ),
+        "hwid": (
+            "🔄 <b>Как перенести лицензию на новый компьютер или после переустановки Windows?</b>\n\n"
+            "Каждая лицензия защищена криптографической привязкой к HWID вашего компьютера.\n\n"
+            "Если вы переустановили Windows, заменили материнскую плату, диск или купили новый ПК:\n"
+            "1. Перейдите в раздел <b>«🔄 Перенести лицензию»</b> в боте.\n"
+            "2. Оплатите сброс привязки HWID (<b>150 ₽</b>).\n"
+            "3. Привязка автоматически сбросится, и вы сможете сразу активировать ключ на новом ПК!"
+        ),
+        "keys": (
+            "🔑 <b>Где взять ключ и как его активировать?</b>\n\n"
+            "1. Выберите подходящий тариф в меню <b>«💳 Купить лицензию»</b>.\n"
+            "2. Оплатите через Stars, СБП, карту или баланс.\n"
+            "3. Бот сразу выдаст ключ вида <code>WINC-XXXX-XXXX-XXXX</code>.\n"
+            "4. Запустите <code>WinCleaner.exe</code> и вставьте ключ в окно авторизации."
+        ),
+        "errors": (
+            "⚙️ <b>Решение распространенных ошибок:</b>\n\n"
+            "• <b>Ошибка «Ключ не найден»:</b> Проверьте, чтобы в ключе не было лишних пробелов в начале или конце.\n"
+            "• <b>Ошибка «Превышен лимит устройств»:</b> Перейдите в «💻 Мои устройства» или «🔄 Перенести лицензию» для сброса старого ПК.\n"
+            "• <b>Ошибка «Нет связи с сервером»:</b> Проверьте интернет-соединение. Программе нужен интернет только на 2 секунды во время активации."
+        )
+    }
+
+    ans = answers.get(topic, "Информация обновляется.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к списку вопросов", callback_data="user_faq")],
+        [InlineKeyboardButton(text="💬 Задать свой вопрос поддержке", callback_data="user_start_ticket")]
+    ])
+    try:
+        await callback.message.edit_text(ans, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(ans, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(F.text.in_({"📢 Что нового", "Что нового", "/changelog", "/updates"}))
+async def handle_whats_new(message: Message):
+    if await check_user_banned(message.from_user.id):
+        return
+
+    text = (
+        "🚀 <b>Что нового в WinCleaner v2.0 PRO:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "✨ <b>Новое ядро очистки реестра 2.0:</b>\n"
+        "• Скорость сканирования увеличена на 300% благодаря параллельной обработке веток реестра.\n"
+        "• Безопасное удаление битых CLSID, следов деинсталлированных программ и кэша MUI-кэша.\n\n"
+        "🛡️ <b>Защита приватности и анти-слежка Windows 11 / 10:</b>\n"
+        "• Отключение назойливой рекламы в меню Пуск и Проводнике.\n"
+        "• Блокировка телеметрии Microsoft DiagTrack и сборщиков телеметрии Office.\n\n"
+        "⚡ <b>Игровой твикер сети (Low Ping):</b>\n"
+        "• Оптимизация TCP Window Size, MTU и отключение алгоритма Nagle для минимального инпут-лага.\n"
+        "• Быстрый сброс DNS и сетевых очередей в 1 клик.\n\n"
+        "🤖 <b>Обновленный Telegram-бот:</b>\n"
+        "• Мгновенная оплата через Telegram Stars, баланс и СБП.\n"
+        "• Партнерская программа с кэшбэком 15% за приглашенных друзей.\n"
+        "• Персональные промокоды и удобное управление устройствами."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Выбрать тариф v2.0 PRO", callback_data="nav_tariffs")],
+        [InlineKeyboardButton(text="⚡ Как активировать", callback_data="nav_how_activate")]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @router.message(F.text == "⚡ Как активировать")
@@ -682,34 +1239,47 @@ async def handle_my_devices(message: Message):
             await message.answer("Пожалуйста, нажмите /start.")
             return
 
-        stmt = select(Device).join(License).where(License.user_id == user.id, Device.is_active == True)
+        stmt = select(Device, License).join(License, Device.license_id == License.id).where(
+            License.user_id == user.id, Device.is_active == True
+        )
         res = await db.execute(stmt)
-        devices = res.scalars().all()
+        rows = res.all()
 
-        if not devices:
+        if not rows:
             text = (
                 "💻 <b>Привязанные устройства:</b>\n\n"
                 "На ваших лицензиях пока нет активных ПК.\n"
-                "При первом запуске и активации ключа ваш компьютер появится здесь автоматически."
+                "При первом запуске WinCleaner и вводе ключа ваш компьютер появится здесь автоматически!"
             )
             await message.answer(text, parse_mode="HTML")
             return
 
-        text_lines = ["💻 <b>Ваши активные устройства:</b>\n"]
-        for d in devices:
-            safe_dev = escape_html(d.device_name)
-            last_date = d.last_seen.strftime('%d.%m.%Y %H:%M')
-            text_lines.append(
-                f"• 🖥️ <b>{safe_dev}</b>\n"
-                f"  HWID: <code>{d.hwid[:16]}...</code>\n"
-                f"  Активность: <code>{last_date} UTC</code>\n"
-            )
+        lines = ["💻 <b>Ваши привязанные компьютеры:</b>\n"]
+        buttons = []
+        for dev, lic in rows:
+            safe_dev = escape_html(dev.device_name or "PC")
+            safe_os = escape_html(dev.os_version or "Windows 10/11")
+            safe_app = escape_html(dev.app_version or "2.0.0")
+            last_date = dev.last_seen.strftime('%d.%m.%Y %H:%M')
 
-        text_lines.append("\n<i>Вы можете отвязать устройства в любой момент кнопкой ниже:</i>")
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Сбросить привязку всех ПК", callback_data="user_confirm_unbind_all")]
+            lines.append(
+                f"🖥️ <b>{safe_dev}</b> (Ключ: <code>{lic.license_key[:9]}...</code>)\n"
+                f"   🪟 ОС: <b>{safe_os}</b> | Версия: <code>v{safe_app}</code>\n"
+                f"   🆔 HWID: <code>{dev.hwid[:14]}...</code>\n"
+                f"   🕒 Был в сети: <code>{last_date} UTC</code>\n"
+            )
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🔄 Отвязать {safe_dev} (150 ₽)",
+                    callback_data=f"buy_tariff:hwid_{dev.id}:150"
+                )
+            ])
+
+        buttons.append([
+            InlineKeyboardButton(text="🔄 Сбросить ВСЕ устройства (150 ₽)", callback_data="buy_tariff:hwid:150")
         ])
-        await message.answer("\n".join(text_lines), reply_markup=kb, parse_mode="HTML")
+
+        await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 
 @router.message(F.text == "🔄 Перенести лицензию")
@@ -1671,6 +2241,238 @@ async def cmd_users(message: Message):
         await message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
 
+@router.message(Command("analytics"))
+@router.message(Command("finance"))
+@router.callback_query(F.data == "admin_analytics")
+async def handle_admin_analytics(event):
+    message = event if isinstance(event, Message) else event.message
+    admin_id = event.from_user.id
+    if not is_admin(admin_id, event.from_user.username):
+        if isinstance(event, CallbackQuery):
+            await event.answer("⛔ Доступ запрещен.", show_alert=True)
+        return
+
+    now = utc_now()
+    t_24h = now - timedelta(days=1)
+    t_7d = now - timedelta(days=7)
+    t_30d = now - timedelta(days=30)
+
+    async with AsyncSessionLocal() as db:
+        # Orders stats
+        total_revenue = (await db.execute(
+            select(func.coalesce(func.sum(Order.amount_rub), 0)).where(Order.status == "paid")
+        )).scalar() or 0
+
+        rev_24h = (await db.execute(
+            select(func.coalesce(func.sum(Order.amount_rub), 0)).where(Order.status == "paid", Order.created_at >= t_24h)
+        )).scalar() or 0
+
+        rev_7d = (await db.execute(
+            select(func.coalesce(func.sum(Order.amount_rub), 0)).where(Order.status == "paid", Order.created_at >= t_7d)
+        )).scalar() or 0
+
+        rev_30d = (await db.execute(
+            select(func.coalesce(func.sum(Order.amount_rub), 0)).where(Order.status == "paid", Order.created_at >= t_30d)
+        )).scalar() or 0
+
+        paid_orders_count = (await db.execute(
+            select(func.count(Order.id)).where(Order.status == "paid")
+        )).scalar() or 0
+
+        total_users = (await db.execute(select(func.count(User.id)))).scalar() or 1
+        paying_users = (await db.execute(
+            select(func.count(func.distinct(Order.user_id))).where(Order.status == "paid")
+        )).scalar() or 0
+
+        cr_pct = round((paying_users / total_users) * 100, 1) if total_users > 0 else 0.0
+
+        # Referrals stats
+        total_cashback_paid = (await db.execute(
+            select(func.coalesce(func.sum(ReferralHistory.reward_rub), 0))
+        )).scalar() or 0
+
+        active_referrers = (await db.execute(
+            select(func.count(func.distinct(ReferralHistory.referrer_id)))
+        )).scalar() or 0
+
+        # Promo stats
+        promos_count = (await db.execute(select(func.count(PromoCode.id)))).scalar() or 0
+
+    analytics_text = (
+        "📊 <b>ФИНАНСОВАЯ И БИЗНЕС-АНАЛИТИКА WinCleaner</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Общая выручка:</b> <b>{total_revenue:,} ₽</b>\n"
+        f"📅 <b>За 24 часа:</b> <b>{rev_24h:,} ₽</b>\n"
+        f"📅 <b>За 7 дней:</b> <b>{rev_7d:,} ₽</b>\n"
+        f"📅 <b>За 30 дней:</b> <b>{rev_30d:,} ₽</b>\n"
+        f"📦 <b>Оплаченных заказов:</b> <b>{paid_orders_count}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>Конверсия в оплату (CR):</b> <b>{cr_pct}%</b> ({paying_users} из {total_users} клиентов)\n"
+        f"🤝 <b>Реферальный кэшбэк:</b> начислено <b>{total_cashback_paid:,} ₽</b> ({active_referrers} партнеров)\n"
+        f"🎟 <b>Промокодов в базе:</b> <b>{promos_count}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ <i>Авто-оплаты через Telegram Stars и баланс зачисляются моментально.</i>"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить аналитику", callback_data="admin_analytics")],
+        [InlineKeyboardButton(text="🎟 Список промокодов", callback_data="admin_promos_list")],
+        [InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin_panel_refresh")]
+    ])
+
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.message.edit_text(analytics_text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await event.message.answer(analytics_text, reply_markup=kb, parse_mode="HTML")
+        await event.answer()
+    else:
+        await message.answer(analytics_text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.message(Command("createpromo"))
+async def cmd_create_promo(message: Message):
+    if not is_admin(message.from_user.id, message.from_user.username):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3 or not parts[2].isdigit():
+        await message.answer(
+            "Использование: <code>/createpromo &lt;КОД&gt; &lt;СКИДКА%&gt; [ЛИМИТ]</code>\n"
+            "Пример: <code>/createpromo START20 20 100</code> (скидка 20%, 100 активаций)",
+            parse_mode="HTML"
+        )
+        return
+
+    code = parts[1].strip().upper()
+    discount = int(parts[2])
+    max_uses = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 100
+
+    async with AsyncSessionLocal() as db:
+        existing = (await db.execute(select(PromoCode).where(PromoCode.code == code))).scalar_one_or_none()
+        if existing:
+            existing.discount_percent = discount
+            existing.max_uses = max_uses
+            existing.is_active = True
+        else:
+            p = PromoCode(
+                code=code,
+                discount_percent=discount,
+                max_uses=max_uses,
+                current_uses=0,
+                is_active=True
+            )
+            db.add(p)
+        await db.commit()
+
+    await message.answer(
+        f"✅ <b>Промокод «{code}» успешно сохранен!</b>\n"
+        f"• Скидка: <b>{discount}%</b>\n"
+        f"• Лимит использований: <b>{max_uses}</b>",
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("promos"))
+@router.callback_query(F.data == "admin_promos_list")
+async def handle_admin_promos_list(event):
+    message = event if isinstance(event, Message) else event.message
+    admin_id = event.from_user.id
+    if not is_admin(admin_id, event.from_user.username):
+        return
+
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(PromoCode).order_by(desc(PromoCode.id)))
+        promos = res.scalars().all()
+
+    if not promos:
+        txt = "🎟 В системе пока нет промокодов.\nСоздайте новый: <code>/createpromo START20 20 100</code>"
+    else:
+        lines = ["🎟 <b>Активные промокоды WinCleaner:</b>\n"]
+        for p in promos:
+            status = "🟢" if p.is_active else "🔴"
+            lines.append(f"• {status} <code>{p.code}</code> — Скидка: <b>{p.discount_percent}%</b> (Исп: {p.current_uses}/{p.max_uses})")
+        txt = "\n".join(lines)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin_panel_refresh")]
+    ])
+
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await event.message.answer(txt, reply_markup=kb, parse_mode="HTML")
+        await event.answer()
+    else:
+        await message.answer(txt, reply_markup=kb, parse_mode="HTML")
+
+
+@router.message(Command("announce"))
+async def cmd_announce(message: Message):
+    if not is_admin(message.from_user.id, message.from_user.username):
+        return
+
+    text_to_send = message.text.partition(" ")[2].strip()
+    if not text_to_send:
+        await message.answer(
+            "Использование: <code>/announce &lt;текст анонса обновления&gt;</code>\n"
+            "Пример: <code>/announce 🚀 Вышло глобальное обновление WinCleaner v2.0 PRO! Новые твики и очистка уже доступны.</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    formatted = (
+        "📢 <b>ОФИЦИАЛЬНОЕ ОБНОВЛЕНИЕ WinCleaner</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{escape_html(text_to_send)}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Подробности в меню «📢 Что нового» и «💳 Купить лицензию»</i>"
+    )
+
+    bot = get_bot_instance()
+    async with AsyncSessionLocal() as db:
+        stmt = select(User.telegram_id).distinct()
+        res = await db.execute(stmt)
+        user_ids = res.scalars().all()
+
+    status_msg = await message.answer(f"📢 Запуск рассылки анонса для {len(user_ids)} пользователей...")
+    success = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, formatted, parse_mode="HTML")
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        f"📢 <b>Анонс обновления успешно разослан!</b>\n\n"
+        f"✅ Доставлено: <b>{success}</b>\n"
+        f"❌ Ошибок: <b>{failed}</b>",
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("check_expirations"))
+async def cmd_check_expirations(message: Message):
+    if not is_admin(message.from_user.id, message.from_user.username):
+        return
+
+    from app.retention import check_and_send_license_reminders
+    bot = get_bot_instance()
+    stats = await check_and_send_license_reminders(bot)
+
+    await message.answer(
+        "🔄 <b>Проверка истекающих лицензий завершена:</b>\n\n"
+        f"• Напоминаний за 3 дня: <b>{stats.get('reminded_3d', 0)}</b>\n"
+        f"• Напоминаний за 1 день: <b>{stats.get('reminded_1d', 0)}</b>\n"
+        f"• Уведомлений об окончании: <b>{stats.get('reminded_expired', 0)}</b>",
+        parse_mode="HTML"
+    )
+
+
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message):
     if not is_admin(message.from_user.id, message.from_user.username):
@@ -2285,6 +3087,49 @@ async def handle_incoming_relay_and_support(message: Message):
     # -----------------------------------------------------------------------
     if await check_user_banned(sender_id):
         await message.answer("⛔ Доступ к сервису ограничен.")
+        return
+
+    # Check if user was entering a promo code
+    if sender_id in _user_waiting_promo:
+        _user_waiting_promo.discard(sender_id)
+        raw_code = (message.text or "").strip().upper()
+        async with AsyncSessionLocal() as db:
+            p_stmt = select(PromoCode).where(PromoCode.code == raw_code, PromoCode.is_active == True)
+            p_res = await db.execute(p_stmt)
+            promo = p_res.scalar_one_or_none()
+
+            if not promo:
+                await message.answer(
+                    f"❌ <b>Промокод «{escape_html(raw_code)}» не найден или недействителен.</b>\n\n"
+                    "Проверьте правильность написания или напишите в поддержку.",
+                    reply_markup=get_tariffs_inline_keyboard(0),
+                    parse_mode="HTML"
+                )
+                return
+
+            if promo.max_uses and promo.current_uses >= promo.max_uses:
+                await message.answer(
+                    f"❌ <b>Лимит активаций промокода «{escape_html(raw_code)}» исчерпан.</b>",
+                    reply_markup=get_tariffs_inline_keyboard(0),
+                    parse_mode="HTML"
+                )
+                return
+
+            # Activate promo for user
+            promo.current_uses += 1
+            _user_active_promo[sender_id] = {
+                "code": promo.code,
+                "discount_percent": promo.discount_percent
+            }
+            await db.commit()
+
+        await message.answer(
+            f"🎉 <b>Промокод «{promo.code}» успешно активирован!</b>\n\n"
+            f"Вам начислена скидка <b>{promo.discount_percent}%</b> на все тарифы WinCleaner!\n"
+            "Цены в каталоге ниже пересчитаны со скидкой ⬇️",
+            reply_markup=get_tariffs_inline_keyboard(promo.discount_percent),
+            parse_mode="HTML"
+        )
         return
 
     if check_flood(sender_id):

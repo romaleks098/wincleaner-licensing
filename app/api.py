@@ -199,6 +199,11 @@ async def activate_license(
     if existing_dev:
         existing_dev.last_seen = now
         existing_dev.device_name = req.device_name or existing_dev.device_name
+        if getattr(req, "os_version", None):
+            existing_dev.os_version = req.os_version
+        if getattr(req, "app_version", None):
+            existing_dev.app_version = req.app_version
+        existing_dev.ip_address = client_ip
     else:
         if len(active_devices) >= lic.max_devices:
             log = ActivationLog(
@@ -224,6 +229,9 @@ async def activate_license(
             license_id=lic.id,
             hwid=hwid,
             device_name=req.device_name or "PC",
+            os_version=getattr(req, "os_version", "Windows 10/11") or "Windows 10/11",
+            app_version=getattr(req, "app_version", "2.0.0") or "2.0.0",
+            ip_address=client_ip,
             is_active=True,
             first_seen=now,
             last_seen=now
@@ -307,6 +315,11 @@ async def validate_license(
         )
 
     dev.last_seen = now
+    if getattr(req, "os_version", None):
+        dev.os_version = req.os_version
+    if getattr(req, "app_version", None):
+        dev.app_version = req.app_version
+    dev.ip_address = client_ip
     await db.commit()
 
     sig = sign_license(lic.license_key, hwid, lic.expires_at)

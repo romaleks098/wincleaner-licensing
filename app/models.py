@@ -11,10 +11,15 @@ class User(Base):
     username = Column(String(128), nullable=True)
     first_name = Column(String(128), nullable=True)
     is_banned = Column(Boolean, default=False, nullable=False)
+    balance = Column(Integer, default=0, nullable=False) # In RUB (from referrals/cashback)
+    referrer_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    referral_code = Column(String(32), unique=True, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     licenses = relationship("License", back_populates="user", cascade="all, delete-orphan")
     tickets = relationship("SupportTicket", back_populates="user", cascade="all, delete-orphan")
+    orders = relationship("Order", back_populates="user", cascade="all, delete-orphan")
+    referrer = relationship("User", remote_side=[id], backref="referrals")
 
 class License(Base):
     __tablename__ = "licenses"
@@ -27,6 +32,9 @@ class License(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     expires_at = Column(DateTime, nullable=False)
     notes = Column(Text, nullable=True)
+    reminder_3d_sent = Column(Boolean, default=False, nullable=False)
+    reminder_1d_sent = Column(Boolean, default=False, nullable=False)
+    expired_sent = Column(Boolean, default=False, nullable=False)
 
     user = relationship("User", back_populates="licenses")
     devices = relationship("Device", back_populates="license", cascade="all, delete-orphan")
@@ -39,6 +47,9 @@ class Device(Base):
     license_id = Column(Integer, ForeignKey("licenses.id", ondelete="CASCADE"), nullable=False, index=True)
     hwid = Column(String(128), nullable=False, index=True)
     device_name = Column(String(128), default="PC", nullable=False)
+    os_version = Column(String(128), default="Windows 10/11", nullable=False)
+    app_version = Column(String(32), default="2.0.0", nullable=False)
+    ip_address = Column(String(64), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     first_seen = Column(DateTime, default=datetime.utcnow, nullable=False)
     last_seen = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -89,3 +100,45 @@ class TicketMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     ticket = relationship("SupportTicket", back_populates="messages")
+
+class PromoCode(Base):
+    __tablename__ = "promo_codes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String(64), unique=True, index=True, nullable=False)
+    discount_percent = Column(Integer, default=10, nullable=False) # Percentage (e.g. 10, 20, 50)
+    max_uses = Column(Integer, default=100, nullable=False)
+    current_uses = Column(Integer, default=0, nullable=False)
+    valid_until = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(String(64), unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    user_telegram_id = Column(BigInteger, index=True, nullable=False)
+    item_type = Column(String(32), nullable=False) # month, year, lifetime, hwid
+    amount_rub = Column(Integer, nullable=False)
+    stars_amount = Column(Integer, default=0, nullable=False)
+    payment_method = Column(String(32), default="stars", nullable=False) # stars, cryptobot, sbp, balance
+    status = Column(String(32), default="pending", nullable=False) # pending, paid, cancelled
+    promo_code_id = Column(Integer, ForeignKey("promo_codes.id", ondelete="SET NULL"), nullable=True)
+    result_license_key = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    paid_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="orders")
+    promo = relationship("PromoCode")
+
+class ReferralHistory(Base):
+    __tablename__ = "referral_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    referrer_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    referred_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    reward_rub = Column(Integer, default=0, nullable=False)
+    order_id = Column(Integer, ForeignKey("orders.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

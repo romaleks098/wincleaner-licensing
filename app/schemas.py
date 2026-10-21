@@ -6,6 +6,8 @@ class ActivationRequest(BaseModel):
     license_key: str = Field(..., description="License Key in format WINC-XXXX-XXXX-XXXX")
     hwid: str = Field(..., description="Unique client machine HWID (SHA-256 hex)")
     device_name: Optional[str] = Field("PC", description="Friendly device hostname")
+    os_version: Optional[str] = Field("Windows 10/11", description="Operating system details")
+    app_version: Optional[str] = Field("2.0.0", description="Client software build version")
 
 class ActivationResponse(BaseModel):
     status: str
@@ -18,6 +20,8 @@ class ActivationResponse(BaseModel):
 class ValidateRequest(BaseModel):
     license_key: str
     hwid: str
+    os_version: Optional[str] = "Windows 10/11"
+    app_version: Optional[str] = "2.0.0"
 
 class ValidateResponse(BaseModel):
     status: str

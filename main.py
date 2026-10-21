@@ -97,15 +97,19 @@ async def start_bot_service():
             await bot_instance.set_webhook(
                 url=webhook_url,
                 drop_pending_updates=False,
-                allowed_updates=["message", "callback_query"]
+                allowed_updates=["message", "callback_query", "pre_checkout_query"]
             )
             logger.info("Telegram Webhook registered successfully! Bot is active 24/7 via incoming HTTPS requests.")
+            from app.retention import start_retention_scheduler
+            asyncio.create_task(start_retention_scheduler(bot_instance))
             return
         except Exception as e:
             logger.error(f"Failed to set Telegram Webhook: {e}. Falling back to polling...")
 
     # Local mode: polling with auto-reconnect
     logger.info("Running in long-polling mode (local development)...")
+    from app.retention import start_retention_scheduler
+    asyncio.create_task(start_retention_scheduler(bot_instance))
     retry_delay = 5
     while True:
         try:
