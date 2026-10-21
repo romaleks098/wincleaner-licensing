@@ -51,3 +51,14 @@ class AdminRevokeRequest(BaseModel):
 class AdminExtendRequest(BaseModel):
     license_key: str
     extra_days: int = Field(30, ge=1, le=3650)
+
+class PayloadRequest(BaseModel):
+    license_key: str
+    hwid: str
+
+class PayloadResponse(BaseModel):
+    status: str
+    encrypted_payload: str
+    iv: str
+    signature: str
+    rules_version: str

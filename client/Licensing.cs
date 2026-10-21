@@ -319,34 +319,17 @@ namespace WinCleaner.Licensing
             "ida", "ida64", "idag", "idag64", "idaw", "idaw64", "ghidra",
             "cheatengine-x86_64", "cheatengine-i386", "cheatengine",
             "scylla", "scylla_x64", "scylla_x86", "charles", "fiddler",
-            "httpdebuggerui", "httpdebugger", "wireshark", "processhacker",
-            "megadumper", "extremedumper", "procmon", "procexp", "simpleassemblyexplorer"
+            "httpdebuggerui", "httpdebugger", "wireshark",
+            "megadumper", "extremedumper", "simpleassemblyexplorer"
         };
 
         private static Thread _watchdogThread;
         private static volatile bool _watchdogStarted = false;
 
-        public static void ErasePEHeaderInMemory()
-        {
-            try
-            {
-                IntPtr baseAddress = Process.GetCurrentProcess().MainModule.BaseAddress;
-                uint oldProtect;
-                if (VirtualProtect(baseAddress, (UIntPtr)4096, 0x04 /* PAGE_READWRITE */, out oldProtect))
-                {
-                    byte[] zeros = new byte[4096];
-                    Marshal.Copy(zeros, 0, baseAddress, 4096);
-                    VirtualProtect(baseAddress, (UIntPtr)4096, oldProtect, out oldProtect);
-                }
-            }
-            catch { }
-        }
-
         public static void StartWatchdog()
         {
             if (_watchdogStarted) return;
             _watchdogStarted = true;
-            ErasePEHeaderInMemory();
             _watchdogThread = new Thread(WatchdogLoop)
             {
                 IsBackground = true,

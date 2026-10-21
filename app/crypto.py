@@ -48,3 +48,34 @@ def generate_key_string() -> str:
         parts.append("".join(secrets.choice(alphabet) for _ in range(4)))
     return "-".join(parts)
 
+def derive_payload_key(signature_b64: str, hwid: str) -> bytes:
+    """
+    Derives 256-bit AES session key matching C# LicenseGuard._sessionToken:
+    SHA-256(sigBytes + hwidBytes + b'WinClean')
+    """
+    import hashlib
+    sig_bytes = base64.b64decode(signature_b64)
+    hwid_bytes = hwid.strip().upper().encode("utf-8")
+    salt = b"WinClean"
+    combined = sig_bytes + hwid_bytes + salt
+    return hashlib.sha256(combined).digest()
+
+def encrypt_cloud_payload(payload_bytes: bytes, key: bytes) -> tuple:
+    """
+    Encrypts payload dictionary with AES-256-CBC matching .NET RijndaelManaged PKCS7.
+    Returns (encrypted_b64, iv_b64).
+    """
+    import secrets
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives import padding
+
+    iv = secrets.token_bytes(16)
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(payload_bytes) + padder.finalize()
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+    return base64.b64encode(ciphertext).decode("ascii"), base64.b64encode(iv).decode("ascii")
+

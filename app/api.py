@@ -12,14 +12,17 @@ from sqlalchemy import select, func
 
 from app.config import settings
 from app.database import get_db
+import json
 from app.models import User, License, Device, ActivationLog
 from app.schemas import (
     ActivationRequest, ActivationResponse,
     ValidateRequest, ValidateResponse,
     DeactivateRequest, DeactivateResponse,
-    AdminGenerateKeyRequest, AdminRevokeRequest, AdminExtendRequest
+    AdminGenerateKeyRequest, AdminRevokeRequest, AdminExtendRequest,
+    PayloadRequest, PayloadResponse
 )
-from app.crypto import sign_license, generate_key_string
+from app.crypto import sign_license, generate_key_string, derive_payload_key, encrypt_cloud_payload
+from app.payload_data import MASTER_CLOUD_RULES, CLOUD_RULES_VERSION
 from app.bot import send_admin_alert, escape_html, get_bot_instance, get_dp_instance
 from aiogram.types import Update
 
@@ -330,6 +333,50 @@ async def validate_license(
         hwid=hwid,
         expires_at=lic.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         signature=sig
+    )
+
+@router.post("/payload", response_model=PayloadResponse)
+async def get_cloud_payload(
+    req: PayloadRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+):
+    check_rate_limit(request)
+    key = req.license_key.strip().upper()
+    hwid = req.hwid.strip().upper()
+
+    stmt = select(License).where(License.license_key == key)
+    res = await db.execute(stmt)
+    lic = res.scalar_one_or_none()
+
+    if not lic or lic.status != "active" or datetime.utcnow() > lic.expires_at:
+        raise HTTPException(
+            status_code=403,
+            detail="Действующая лицензия не найдена или срок действия истек. Оформите лицензию в боте @WinCleanerLicense_Bot."
+        )
+
+    dev_stmt = select(Device).where(Device.license_id == lic.id, Device.hwid == hwid, Device.is_active == True)
+    dev_res = await db.execute(dev_stmt)
+    dev = dev_res.scalar_one_or_none()
+
+    if not dev:
+        raise HTTPException(
+            status_code=403,
+            detail="Устройство не привязано к этой лицензии. Сначала активируйте ключ на данном ПК."
+        )
+
+    sig_b64 = sign_license(lic.license_key, hwid, lic.expires_at)
+    aes_key = derive_payload_key(sig_b64, hwid)
+
+    raw_json = json.dumps(MASTER_CLOUD_RULES).encode("utf-8")
+    enc_b64, iv_b64 = encrypt_cloud_payload(raw_json, aes_key)
+
+    return PayloadResponse(
+        status="ok",
+        encrypted_payload=enc_b64,
+        iv=iv_b64,
+        signature=sig_b64,
+        rules_version=CLOUD_RULES_VERSION
     )
 
 @router.post("/deactivate", response_model=DeactivateResponse)

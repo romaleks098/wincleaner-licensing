@@ -4520,7 +4520,6 @@ namespace WinCleaner
         public static int Main(string[] args)
         {
             WinCleaner.Licensing.AntiDebug.StartWatchdog();
-            WinCleaner.Licensing.AntiDebug.ErasePEHeaderInMemory();
 
             bool headless = false;
             bool skipElevate = false;
