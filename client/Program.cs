@@ -1360,6 +1360,17 @@ namespace WinCleaner
 
     public static class Cleaner
     {
+        public static void EnsureCloudEngineReady()
+        {
+            WinCleaner.Licensing.LicenseGuard.AssertOperational();
+            string cloudJson = WinCleaner.Licensing.LicenseManager.GetCloudPayloadJson();
+            if (string.IsNullOrEmpty(cloudJson))
+            {
+                Process.GetCurrentProcess().Kill();
+                throw new InvalidOperationException("Операция заблокирована: правила очистки не получены от сервера.");
+            }
+        }
+
         const string Exp = @"Software\Microsoft\Windows\CurrentVersion\Explorer\";
 
         static readonly string[] BagKeys = new string[]
@@ -1465,7 +1476,7 @@ namespace WinCleaner
 
         static CleanResult WithExplorerStopped(bool history, bool bags)
         {
-            WinCleaner.Licensing.LicenseGuard.AssertOperational();
+            EnsureCloudEngineReady();
             CleanResult r = new CleanResult();
             if (history) { try { NativeMethods.SHAddToRecentDocs(0, IntPtr.Zero); } catch { } }
 
@@ -4519,6 +4530,14 @@ namespace WinCleaner
         [STAThread]
         public static int Main(string[] args)
         {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e)
+            {
+                MessageBox.Show(e.Exception.ToString(), "WinCleaner UI Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            };
+
             WinCleaner.Licensing.AntiDebug.StartWatchdog();
 
             bool headless = false;
@@ -4579,14 +4598,6 @@ namespace WinCleaner
                     }
                 }
             }
-
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-            Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e)
-            {
-                MessageBox.Show(e.Exception.ToString(), "WinCleaner UI Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            };
 
             try
             {

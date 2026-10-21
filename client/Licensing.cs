@@ -889,6 +889,59 @@ namespace WinCleaner.Licensing
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
         }
 
+        private static string _cachedCloudPayload = null;
+
+        public static string GetCloudPayloadJson()
+        {
+            if (!string.IsNullOrEmpty(_cachedCloudPayload))
+                return _cachedCloudPayload;
+
+            _cachedCloudPayload = FetchCloudPayloadJson();
+            return _cachedCloudPayload;
+        }
+
+        public static string FetchCloudPayloadJson()
+        {
+            if (CurrentLicense == null || !VerifySignature(CurrentLicense))
+                return null;
+
+            try
+            {
+                EnsureSecurityProtocols();
+                string url = ServerUrl.TrimEnd('/') + "/api/v1/payload";
+                string json = string.Format("{{\"license_key\":\"{0}\",\"hwid\":\"{1}\"}}",
+                    EscapeJson(CurrentLicense.LicenseKey.Trim()),
+                    EscapeJson(CurrentLicense.Hwid.Trim()));
+
+                string resp = HttpPostJson(url, json);
+                if (string.IsNullOrEmpty(resp)) return null;
+
+                string encB64 = ExtractJsonValue(resp, "encrypted_payload");
+                string ivB64 = ExtractJsonValue(resp, "iv");
+                if (string.IsNullOrEmpty(encB64) || string.IsNullOrEmpty(ivB64))
+                    return null;
+
+                byte[] cipherBytes = Convert.FromBase64String(encB64);
+                byte[] ivBytes = Convert.FromBase64String(ivB64);
+
+                byte[] fullData = new byte[ivBytes.Length + cipherBytes.Length];
+                Buffer.BlockCopy(ivBytes, 0, fullData, 0, ivBytes.Length);
+                Buffer.BlockCopy(cipherBytes, 0, fullData, ivBytes.Length, cipherBytes.Length);
+
+                byte[] dec = LicenseGuard.DecryptPayload(fullData);
+                if (dec != null && dec.Length > 0)
+                {
+                    _cachedCloudPayload = Encoding.UTF8.GetString(dec);
+                    return _cachedCloudPayload;
+                }
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+            }
+            return null;
+        }
+
         public static string ExtractJsonValue(string json, string key)
         {
             if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return null;
