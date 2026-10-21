@@ -20,6 +20,7 @@ class User(Base):
     tickets = relationship("SupportTicket", back_populates="user", cascade="all, delete-orphan")
     orders = relationship("Order", back_populates="user", cascade="all, delete-orphan")
     referrer = relationship("User", remote_side=[id], backref="referrals")
+    feature_ideas = relationship("FeatureIdea", back_populates="user")
 
 class License(Base):
     __tablename__ = "licenses"
@@ -142,3 +143,29 @@ class ReferralHistory(Base):
     reward_rub = Column(Integer, default=0, nullable=False)
     order_id = Column(Integer, ForeignKey("orders.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+class FeatureIdea(Base):
+    __tablename__ = "feature_ideas"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    user_telegram_id = Column(BigInteger, index=True, nullable=False)
+    author_name = Column(String(128), default="Пользователь", nullable=False)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=False)
+    votes_count = Column(Integer, default=1, nullable=False)
+    status = Column(String(32), default="approved", nullable=False)  # approved, in_progress, completed, rejected
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    votes = relationship("FeatureVote", back_populates="idea", cascade="all, delete-orphan")
+    user = relationship("User", back_populates="feature_ideas")
+
+class FeatureVote(Base):
+    __tablename__ = "feature_votes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    idea_id = Column(Integer, ForeignKey("feature_ideas.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_telegram_id = Column(BigInteger, index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    idea = relationship("FeatureIdea", back_populates="votes")

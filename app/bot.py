@@ -26,7 +26,7 @@ from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import (
     User, License, Device, ActivationLog, SupportTicket, TicketMessage,
-    PromoCode, Order, ReferralHistory
+    PromoCode, Order, ReferralHistory, FeatureIdea, FeatureVote
 )
 from app.crypto import generate_key_string
 
@@ -45,6 +45,9 @@ _admin_waiting_reply: Dict[int, int] = {}
 
 # In-memory state: user_id -> waiting to enter promo code
 _user_waiting_promo: Set[int] = set()
+
+# In-memory state: user_id -> waiting to propose a feature idea
+_user_waiting_idea: Set[int] = set()
 
 # In-memory state: user_id -> active promo details (e.g. {"code": "START20", "discount_percent": 20})
 _user_active_promo: Dict[int, Dict] = {}
@@ -219,8 +222,8 @@ def get_main_keyboard(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🔑 Моя лицензия"), KeyboardButton(text="💳 Купить лицензию")],
         [KeyboardButton(text="💻 Мои устройства"), KeyboardButton(text="🔄 Перенести лицензию")],
         [KeyboardButton(text="🤝 Партнерка"), KeyboardButton(text="🎟 Промокод")],
-        [KeyboardButton(text="❓ FAQ & Помощь"), KeyboardButton(text="📢 Что нового")],
-        [KeyboardButton(text="⚡ Как активировать"), KeyboardButton(text="💬 Поддержка")]
+        [KeyboardButton(text="💡 Голосование"), KeyboardButton(text="📢 Что нового")],
+        [KeyboardButton(text="❓ FAQ & Помощь"), KeyboardButton(text="💬 Поддержка")]
     ]
     if is_admin_user:
         rows.append([KeyboardButton(text="🛡️ Админ-панель")])
@@ -335,7 +338,10 @@ def get_admin_inline_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")
         ],
         [
-            InlineKeyboardButton(text="📜 Логи безопасности", callback_data="admin_logs"),
+            InlineKeyboardButton(text="💡 Идеи сообщества", callback_data="admin_ideas_list"),
+            InlineKeyboardButton(text="📜 Логи безопасности", callback_data="admin_logs")
+        ],
+        [
             InlineKeyboardButton(text="🔄 Обновить панель", callback_data="admin_panel_refresh")
         ]
     ])
@@ -365,16 +371,25 @@ async def build_admin_panel_text(admin_name: str, admin_id: int, db) -> str:
     active_promos = (await db.execute(
         select(func.count(PromoCode.id)).where(PromoCode.is_active == True)
     )).scalar() or 0
+    total_ideas = (await db.execute(select(func.count(FeatureIdea.id)))).scalar() or 0
 
     return (
         "🛡️ <b>ПАНЕЛЬ АДМИНИСТРАТОРА WinCleaner</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👑 <b>Администратор:</b> {escape_html(admin_name)} (<code>{admin_id}</code>)\n"
-        f"💰 <b>Выручка:</b> <b>{total_rev:,} ₽</b> | 🎟 <b>Промокодов:</b> <b>{active_promos}</b>\n"
+        f"💰 <b>Выручка:</b> <b>{total_rev:,} ₽</b> | 🎟 <b>Промокодов:</b> <b>{active_promos}</b> | 💡 <b>Идей:</b> <b>{total_ideas}</b>\n"
         f"📊 <b>Сводка:</b> 👥 Клиентов: <b>{total_users}</b> | 🔑 Ключей: <b>{active_licenses}/{total_licenses}</b> | 💻 ПК: <b>{active_devices}</b>\n"
         f"📩 <b>Открытых тикетов в саппорт:</b> <b>{open_tickets}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📋 <b>УПРАВЛЕНИЕ И КОМАНДЫ:</b>\n\n"
+        "📊 <b>Финансы и бизнес:</b>\n"
+        "• <code>/analytics</code> или <code>/finance</code> — Детальная выручка (24ч, 7д, 30д), CR, рефералы\n"
+        "• <code>/createpromo &lt;КОД&gt; &lt;СКИДКА%&gt; [ЛИМИТ]</code> — Создать промокод со скидкой\n"
+        "• <code>/promos</code> — Список всех промокодов системы\n\n"
+        "💡 <b>Идеи сообщества и голосование:</b>\n"
+        "• <code>/admin_ideas</code> — Список предложенных функций\n"
+        "• <code>/set_idea_status &lt;id&gt; &lt;статус&gt;</code> — Изменить статус (approved, in_progress, completed, rejected)\n"
+        "• <code>/delete_idea &lt;id&gt;</code> — Удалить идею\n\n"
         "📊 <b>Финансы и бизнес:</b>\n"
         "• <code>/analytics</code> или <code>/finance</code> — Детальная выручка (24ч, 7д, 30д), CR, рефералы\n"
         "• <code>/createpromo &lt;КОД&gt; &lt;СКИДКА%&gt; [ЛИМИТ]</code> — Создать промокод со скидкой\n"
@@ -1152,6 +1167,557 @@ async def cb_faq_item(callback: CallbackQuery):
     except Exception:
         await callback.message.answer(ans, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
+
+
+# ===========================================================================
+# Community Feature Voting Engine
+# ===========================================================================
+
+def get_idea_status_badge(status: str) -> str:
+    if status == "in_progress":
+        return "🛠️ <b>В разработке</b>"
+    elif status == "completed":
+        return "✅ <b>Реализовано в v2.0</b>"
+    elif status == "rejected":
+        return "❌ <b>Отклонено</b>"
+    return "🟢 <b>На голосовании</b>"
+
+
+async def ensure_initial_ideas(db):
+    """Seeds popular community suggestions on fresh databases so the catalog is ready to explore."""
+    count = (await db.execute(select(func.count(FeatureIdea.id)))).scalar() or 0
+    if count == 0:
+        seed_items = [
+            FeatureIdea(
+                user_id=None,
+                user_telegram_id=1,
+                author_name="Алексей (Сообщество)",
+                title="Очистка кэша Discord, Steam и Epic Games",
+                description="Добавить модуль глубокой очистки временных файлов и кэша игровых клиентов (Discord, Steam shader cache, Epic Games Launcher, Riot Client), которые занимают гигабайты на SSD.",
+                votes_count=18,
+                status="in_progress"
+            ),
+            FeatureIdea(
+                user_id=None,
+                user_telegram_id=1,
+                author_name="Максим (PRO-пользователь)",
+                title="Оптимизация оперативной памяти (Standby List Cleaner)",
+                description="Встроить алгоритм автоматического сброса рабочего набора и standby-кэша оперативной памяти перед запуском игр для устранения микрофризов и статтеров в Windows 10/11.",
+                votes_count=24,
+                status="in_progress"
+            ),
+            FeatureIdea(
+                user_id=None,
+                user_telegram_id=1,
+                author_name="Дмитрий",
+                title="Автозапуск фоновой очистки по расписанию",
+                description="Возможность настроить еженедельную тихую очистку системы в фоне без всплывающих окон, с записью лога в журнал.",
+                votes_count=12,
+                status="approved"
+            ),
+            FeatureIdea(
+                user_id=None,
+                user_telegram_id=1,
+                author_name="Сергей",
+                title="Глубокая деинсталляция программ и остатков в реестре",
+                description="Инструмент для полного удаления ненужного ПО с принудительным сканированием оставшихся ключей реестра и скрытых папок в AppData/ProgramData.",
+                votes_count=15,
+                status="approved"
+            ),
+        ]
+        db.add_all(seed_items)
+        await db.commit()
+
+
+async def render_ideas_hub(db, user_telegram_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    """Builds the main community voting hub overview."""
+    await ensure_initial_ideas(db)
+
+    # Top 5 proposals
+    top_stmt = select(FeatureIdea).where(FeatureIdea.status != "rejected").order_by(
+        FeatureIdea.votes_count.desc(), FeatureIdea.id.desc()
+    ).limit(5)
+    top_ideas = (await db.execute(top_stmt)).scalars().all()
+
+    user_ideas_count = (await db.execute(
+        select(func.count(FeatureIdea.id)).where(FeatureIdea.user_telegram_id == user_telegram_id)
+    )).scalar() or 0
+
+    top_lines = []
+    for idx, idea in enumerate(top_ideas, 1):
+        badge = "🛠️" if idea.status == "in_progress" else ("✅" if idea.status == "completed" else "🟢")
+        top_lines.append(f"{idx}. {badge} <b>{escape_html(idea.title)}</b> — <b>{idea.votes_count}</b> 👍")
+    top_text = "\n".join(top_lines) if top_lines else "<i>Пока предложений нет. Будьте первым!</i>"
+
+    text = (
+        "💡 <b>ГОЛОСОВАНИЕ ЗА НОВЫЕ ФУНКЦИИ WinCleaner</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Здесь пользователи предлагают свои идеи для программы, а сообщество голосует за самые нужные!\n\n"
+        "Функции с наибольшим количеством голосов попадают в приоритетную разработку наших инженеров. 🛠️\n\n"
+        "🏆 <b>Топ предложений по голосам:</b>\n"
+        f"{top_text}\n\n"
+        f"⭐️ <i>Ваших предложенных идей: <b>{user_ideas_count}</b></i>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "👇 <i>Листайте предложения и голосуйте или предложите свою идею!</i>"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔥 Смотреть идеи и голосовать", callback_data="ideas_browse:0")
+        ],
+        [
+            InlineKeyboardButton(text="✍️ Предложить функцию", callback_data="idea_propose"),
+            InlineKeyboardButton(text="⭐️ Мои идеи", callback_data="ideas_my:0")
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Обновить список", callback_data="ideas_hub_refresh")
+        ]
+    ])
+    return text, kb
+
+
+async def render_idea_card(db, user_telegram_id: int, offset: int = 0, filter_user_only: bool = False) -> Tuple[str, InlineKeyboardMarkup]:
+    """Renders a single interactive idea card with carousel navigation and voting."""
+    await ensure_initial_ideas(db)
+
+    if filter_user_only:
+        count_stmt = select(func.count(FeatureIdea.id)).where(FeatureIdea.user_telegram_id == user_telegram_id)
+        query = select(FeatureIdea).where(FeatureIdea.user_telegram_id == user_telegram_id).order_by(FeatureIdea.id.desc())
+    else:
+        count_stmt = select(func.count(FeatureIdea.id)).where(FeatureIdea.status != "rejected")
+        query = select(FeatureIdea).where(FeatureIdea.status != "rejected").order_by(
+            FeatureIdea.votes_count.desc(), FeatureIdea.id.desc()
+        )
+
+    total = (await db.execute(count_stmt)).scalar() or 0
+    if total == 0:
+        if filter_user_only:
+            msg = (
+                "⭐️ <b>У вас пока нет предложенных идей.</b>\n\n"
+                "Вы можете предложить новую функцию для WinCleaner прямо сейчас!"
+            )
+        else:
+            msg = (
+                "💡 <b>Список идей пока пуст.</b>\n\n"
+                "Станьте первым, кто предложит крутую функцию для WinCleaner!"
+            )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Предложить функцию", callback_data="idea_propose")],
+            [InlineKeyboardButton(text="🔙 Меню идей", callback_data="ideas_hub")]
+        ])
+        return msg, kb
+
+    offset = offset % total
+    idea = (await db.execute(query.offset(offset).limit(1))).scalar_one_or_none()
+    if not idea:
+        return "❌ Идея не найдена.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Меню идей", callback_data="ideas_hub")]])
+
+    # Check vote
+    v_res = await db.execute(
+        select(FeatureVote).where(FeatureVote.idea_id == idea.id, FeatureVote.user_telegram_id == user_telegram_id)
+    )
+    has_voted = v_res.scalar_one_or_none() is not None
+
+    status_badge = get_idea_status_badge(idea.status)
+    voted_str = "✅ <i>Вы поддержали эту идею (+1 👍)</i>" if has_voted else "🤍 <i>Вы еще не голосовали за эту идею</i>"
+    created_str = idea.created_at.strftime("%d.%m.%Y")
+
+    card_text = (
+        f"💡 <b>Идея #{idea.id}: {escape_html(idea.title)}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 <b>Описание:</b>\n{escape_html(idea.description)}\n\n"
+        f"👤 <b>Автор:</b> {escape_html(idea.author_name)}\n"
+        f"📅 <b>Дата:</b> {created_str}\n"
+        f"📊 <b>Статус:</b> {status_badge}\n"
+        f"👍 <b>Поддержали:</b> <b>{idea.votes_count}</b> чел.\n"
+        f"{voted_str}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    mode_prefix = "ideas_my" if filter_user_only else "ideas_browse"
+    is_user_flag = "1" if filter_user_only else "0"
+
+    rows = []
+    # Vote / Unvote button
+    if has_voted:
+        rows.append([InlineKeyboardButton(text="✅ Вы поддержали (отменить?)", callback_data=f"idea_unvote:{idea.id}:{offset}:{is_user_flag}")])
+    else:
+        rows.append([InlineKeyboardButton(text="👍 Проголосовать (+1)", callback_data=f"idea_vote:{idea.id}:{offset}:{is_user_flag}")])
+
+    # Carousel
+    prev_off = (offset - 1) % total
+    next_off = (offset + 1) % total
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"{mode_prefix}:{prev_off}"),
+        InlineKeyboardButton(text=f"📌 {offset + 1}/{total}", callback_data="ideas_noop"),
+        InlineKeyboardButton(text="След. ➡️", callback_data=f"{mode_prefix}:{next_off}")
+    ])
+
+    rows.append([
+        InlineKeyboardButton(text="✍️ Предложить функцию", callback_data="idea_propose"),
+        InlineKeyboardButton(text="🔙 Меню идей", callback_data="ideas_hub")
+    ])
+
+    return card_text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(F.text.in_({"💡 Голосование", "💡 Идеи и Голосование", "Голосование", "/ideas", "/vote", "/suggest"}))
+async def handle_ideas_entry(message: Message):
+    if await check_user_banned(message.from_user.id):
+        return
+    _user_waiting_idea.discard(message.from_user.id)
+    async with AsyncSessionLocal() as db:
+        text, kb = await render_ideas_hub(db, message.from_user.id)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.in_({"ideas_hub", "ideas_hub_refresh"}))
+async def cb_ideas_hub(callback: CallbackQuery):
+    if await check_user_banned(callback.from_user.id):
+        await callback.answer("⛔ Доступ ограничен.", show_alert=True)
+        return
+    _user_waiting_idea.discard(callback.from_user.id)
+    async with AsyncSessionLocal() as db:
+        text, kb = await render_ideas_hub(db, callback.from_user.id)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer("Список обновлен" if callback.data == "ideas_hub_refresh" else None)
+
+
+@router.callback_query(F.data.startswith("ideas_browse:"))
+async def cb_ideas_browse(callback: CallbackQuery):
+    if await check_user_banned(callback.from_user.id):
+        await callback.answer("⛔ Доступ ограничен.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    offset = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    async with AsyncSessionLocal() as db:
+        text, kb = await render_idea_card(db, callback.from_user.id, offset=offset, filter_user_only=False)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ideas_my:"))
+async def cb_ideas_my(callback: CallbackQuery):
+    if await check_user_banned(callback.from_user.id):
+        await callback.answer("⛔ Доступ ограничен.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    offset = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    async with AsyncSessionLocal() as db:
+        text, kb = await render_idea_card(db, callback.from_user.id, offset=offset, filter_user_only=True)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "ideas_noop")
+async def cb_ideas_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("idea_vote:"))
+async def cb_idea_vote(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if await check_user_banned(user_id):
+        await callback.answer("⛔ Доступ ограничен.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка запроса.")
+        return
+    idea_id = int(parts[1])
+    offset = int(parts[2]) if parts[2].isdigit() else 0
+    filter_user = (parts[3] == "1") if len(parts) > 3 else False
+
+    async with AsyncSessionLocal() as db:
+        idea_res = await db.execute(select(FeatureIdea).where(FeatureIdea.id == idea_id))
+        idea = idea_res.scalar_one_or_none()
+        if not idea:
+            await callback.answer("Идея не найдена.", show_alert=True)
+            return
+
+        v_res = await db.execute(select(FeatureVote).where(FeatureVote.idea_id == idea_id, FeatureVote.user_telegram_id == user_id))
+        existing_vote = v_res.scalar_one_or_none()
+
+        if existing_vote:
+            await callback.answer("Вы уже проголосовали за эту идею! 👍", show_alert=False)
+        else:
+            new_vote = FeatureVote(idea_id=idea_id, user_telegram_id=user_id)
+            db.add(new_vote)
+            idea.votes_count += 1
+            await db.commit()
+            await callback.answer("Спасибо! Ваш голос учтен! 🎉")
+
+        text, kb = await render_idea_card(db, user_id, offset=offset, filter_user_only=filter_user)
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("idea_unvote:"))
+async def cb_idea_unvote(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if await check_user_banned(user_id):
+        await callback.answer("⛔ Доступ ограничен.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка запроса.")
+        return
+    idea_id = int(parts[1])
+    offset = int(parts[2]) if parts[2].isdigit() else 0
+    filter_user = (parts[3] == "1") if len(parts) > 3 else False
+
+    async with AsyncSessionLocal() as db:
+        idea_res = await db.execute(select(FeatureIdea).where(FeatureIdea.id == idea_id))
+        idea = idea_res.scalar_one_or_none()
+
+        v_res = await db.execute(select(FeatureVote).where(FeatureVote.idea_id == idea_id, FeatureVote.user_telegram_id == user_id))
+        existing_vote = v_res.scalar_one_or_none()
+
+        if existing_vote:
+            await db.delete(existing_vote)
+            if idea:
+                idea.votes_count = max(0, idea.votes_count - 1)
+            await db.commit()
+            await callback.answer("Голос отозван.")
+        else:
+            await callback.answer("Вы еще не голосовали за эту идею.")
+
+        text, kb = await render_idea_card(db, user_id, offset=offset, filter_user_only=filter_user)
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "idea_propose")
+async def cb_idea_propose(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if await check_user_banned(user_id):
+        await callback.answer("⛔ Доступ ограничен.", show_alert=True)
+        return
+
+    _user_waiting_idea.add(user_id)
+    text = (
+        "✍️ <b>Предложите новую функцию для WinCleaner!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Опишите вашу идею прямо в чат ответным сообщением:\n"
+        "• Какую полезную функцию или твик вы хотите видеть в программе?\n"
+        "• Какую проблему это решит?\n\n"
+        "<i>Отправьте сообщение с описанием вашей идеи (или нажмите кнопку отмены ниже):</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="idea_cancel_propose")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "idea_cancel_propose")
+async def cb_idea_cancel_propose(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    _user_waiting_idea.discard(user_id)
+    async with AsyncSessionLocal() as db:
+        text, kb = await render_ideas_hub(db, user_id)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer("Предложение идеи отменено.")
+
+
+# ===========================================================================
+# Admin Idea Moderation Callbacks & Commands
+# ===========================================================================
+
+@router.callback_query(F.data.startswith("adm_idea_st:"))
+async def cb_admin_idea_status(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Требуются права администратора.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка параметров.")
+        return
+    idea_id = int(parts[1])
+    new_status = parts[2]
+
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(FeatureIdea).where(FeatureIdea.id == idea_id))
+        idea = res.scalar_one_or_none()
+        if not idea:
+            await callback.answer("Идея не найдена.", show_alert=True)
+            return
+
+        idea.status = new_status
+        await db.commit()
+
+    badge = get_idea_status_badge(new_status)
+    await callback.answer(f"Статус идеи #{idea_id} обновлен!")
+    try:
+        await callback.message.edit_caption(
+            caption=(callback.message.caption or callback.message.text or "") + f"\n\n⚙️ <i>Статус изменен: {badge}</i>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        try:
+            await callback.message.edit_text(
+                text=(callback.message.text or "") + f"\n\n⚙️ <i>Статус изменен: {badge}</i>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("adm_idea_del:"))
+async def cb_admin_idea_delete(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Требуются права администратора.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 2:
+        await callback.answer("Ошибка параметров.")
+        return
+    idea_id = int(parts[1])
+
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(FeatureIdea).where(FeatureIdea.id == idea_id))
+        idea = res.scalar_one_or_none()
+        if idea:
+            await db.delete(idea)
+            await db.commit()
+
+    await callback.answer(f"Идея #{idea_id} успешно удалена.")
+    try:
+        await callback.message.edit_text(f"🗑️ <b>Идея #{idea_id} удалена из базы данных.</b>", parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "admin_ideas_list")
+async def cb_admin_ideas_list(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ ограничен.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as db:
+        stmt = select(FeatureIdea).order_by(FeatureIdea.votes_count.desc(), FeatureIdea.id.desc()).limit(10)
+        ideas = (await db.execute(stmt)).scalars().all()
+
+    if not ideas:
+        await callback.answer("Список идей пуст.", show_alert=True)
+        return
+
+    lines = ["💡 <b>СПИСОК ИДЕЙ СООБЩЕСТВА (ТОП 10):</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+    kb_rows = []
+    for idea in ideas:
+        badge = "🛠️" if idea.status == "in_progress" else ("✅" if idea.status == "completed" else ("❌" if idea.status == "rejected" else "🟢"))
+        lines.append(f"• <b>#{idea.id}</b> {badge} {escape_html(idea.title)} — <b>{idea.votes_count}</b> 👍")
+        kb_rows.append([
+            InlineKeyboardButton(text=f"⚙️ #{idea.id} 🛠️ В работу", callback_data=f"adm_idea_st:{idea.id}:in_progress"),
+            InlineKeyboardButton(text="✅ Готово", callback_data=f"adm_idea_st:{idea.id}:completed"),
+            InlineKeyboardButton(text="🗑️", callback_data=f"adm_idea_del:{idea.id}")
+        ])
+
+    lines.append("\nКоманды:\n• <code>/set_idea_status &lt;id&gt; &lt;approved|in_progress|completed|rejected&gt;</code>\n• <code>/delete_idea &lt;id&gt;</code>")
+    kb_rows.append([InlineKeyboardButton(text="🔙 Панель управления", callback_data="admin_panel_refresh")])
+
+    try:
+        await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(Command("admin_ideas"))
+async def cmd_admin_ideas(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    async with AsyncSessionLocal() as db:
+        stmt = select(FeatureIdea).order_by(FeatureIdea.votes_count.desc(), FeatureIdea.id.desc()).limit(15)
+        ideas = (await db.execute(stmt)).scalars().all()
+
+    if not ideas:
+        await message.answer("💡 Предложенных идей пока нет.")
+        return
+
+    lines = ["💡 <b>ИДЕИ СООБЩЕСТВА WinCleaner:</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+    for idea in ideas:
+        badge = get_idea_status_badge(idea.status)
+        lines.append(
+            f"<b>#{idea.id}</b> — <b>{escape_html(idea.title)}</b>\n"
+            f"👤 {escape_html(idea.author_name)} (<code>{idea.user_telegram_id}</code>) | 👍 <b>{idea.votes_count}</b> | {badge}\n"
+        )
+    lines.append("Управление: <code>/set_idea_status &lt;id&gt; &lt;статус&gt;</code> или <code>/delete_idea &lt;id&gt;</code>")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("set_idea_status"))
+async def cmd_set_idea_status(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").strip().split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await message.answer("⚠️ Формат: <code>/set_idea_status &lt;id&gt; &lt;approved|in_progress|completed|rejected&gt;</code>", parse_mode="HTML")
+        return
+
+    idea_id = int(parts[1])
+    new_status = parts[2].lower()
+    if new_status not in {"approved", "in_progress", "completed", "rejected"}:
+        await message.answer("⚠️ Допустимые статусы: <code>approved</code>, <code>in_progress</code>, <code>completed</code>, <code>rejected</code>", parse_mode="HTML")
+        return
+
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(FeatureIdea).where(FeatureIdea.id == idea_id))
+        idea = res.scalar_one_or_none()
+        if not idea:
+            await message.answer(f"❌ Идея #{idea_id} не найдена.")
+            return
+        idea.status = new_status
+        await db.commit()
+
+    badge = get_idea_status_badge(new_status)
+    await message.answer(f"✅ Статус идеи <b>#{idea_id}</b> изменен на {badge}.", parse_mode="HTML")
+
+
+@router.message(Command("delete_idea"))
+async def cmd_delete_idea(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("⚠️ Формат: <code>/delete_idea &lt;id&gt;</code>", parse_mode="HTML")
+        return
+    idea_id = int(parts[1])
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(FeatureIdea).where(FeatureIdea.id == idea_id))
+        idea = res.scalar_one_or_none()
+        if not idea:
+            await message.answer(f"❌ Идея #{idea_id} не найдена.")
+            return
+        await db.delete(idea)
+        await db.commit()
+    await message.answer(f"🗑️ Идея <b>#{idea_id}</b> удалена из базы данных.", parse_mode="HTML")
 
 
 @router.message(F.text.in_({"📢 Что нового", "Что нового", "/changelog", "/updates"}))
@@ -3088,6 +3654,99 @@ async def handle_incoming_relay_and_support(message: Message):
     if await check_user_banned(sender_id):
         await message.answer("⛔ Доступ к сервису ограничен.")
         return
+
+    # Check if user was proposing a feature idea
+    if sender_id in _user_waiting_idea:
+        raw_text = (message.text or message.caption or "").strip()
+        menu_triggers = {
+            "🔑 Моя лицензия", "💳 Купить лицензию", "💻 Мои устройства", "🔄 Перенести лицензию",
+            "🤝 Партнерка", "🎟 Промокод", "💡 Голосование", "📢 Что нового", "❓ FAQ & Помощь",
+            "💬 Поддержка", "⚡ Как активировать", "🛡️ Админ-панель"
+        }
+        if raw_text.lower() in {"/cancel", "отмена", "❌ отмена"}:
+            _user_waiting_idea.discard(sender_id)
+            await message.answer("❌ <b>Предложение идеи отменено.</b>", reply_markup=get_main_keyboard(is_admin(sender_id)), parse_mode="HTML")
+            return
+        elif raw_text in menu_triggers:
+            _user_waiting_idea.discard(sender_id)
+        else:
+            _user_waiting_idea.discard(sender_id)
+            if len(raw_text) < 5:
+                await message.answer(
+                    "⚠️ <b>Слишком короткое описание.</b>\n"
+                    "Пожалуйста, опишите идею подробнее (минимум 5 символов), чтобы сообщество могло ее оценить.",
+                    reply_markup=get_main_keyboard(is_admin(sender_id)),
+                    parse_mode="HTML"
+                )
+                return
+
+            # Extract title and description
+            lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+            first_line = lines[0] if lines else raw_text
+            title = first_line[:100]
+            description = raw_text
+            author_name = message.from_user.full_name or message.from_user.username or "Пользователь"
+
+            async with AsyncSessionLocal() as db:
+                u_res = await db.execute(select(User).where(User.telegram_id == sender_id))
+                db_user = u_res.scalar_one_or_none()
+                user_pk = db_user.id if db_user else None
+
+                idea = FeatureIdea(
+                    user_id=user_pk,
+                    user_telegram_id=sender_id,
+                    author_name=author_name,
+                    title=title,
+                    description=description,
+                    votes_count=1,
+                    status="approved"
+                )
+                db.add(idea)
+                await db.flush()
+
+                init_vote = FeatureVote(
+                    idea_id=idea.id,
+                    user_telegram_id=sender_id
+                )
+                db.add(init_vote)
+                await db.commit()
+                idea_id = idea.id
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔥 Смотреть идеи и голосовать", callback_data="ideas_browse:0")],
+                [InlineKeyboardButton(text="💡 В меню идей", callback_data="ideas_hub")]
+            ])
+            await message.answer(
+                f"🎉 <b>Ваша идея успешно опубликована!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💡 <b>«{escape_html(title)}»</b>\n\n"
+                f"Ваш голос уже автоматически учтен (+1 👍).\n"
+                f"Теперь другие пользователи могут голосовать за ваше предложение в разделе <b>💡 Голосование</b>!",
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+
+            # Alert admin with 1-click moderation buttons
+            adm_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🛠️ В разработку", callback_data=f"adm_idea_st:{idea_id}:in_progress"),
+                    InlineKeyboardButton(text="✅ Реализовано", callback_data=f"adm_idea_st:{idea_id}:completed")
+                ],
+                [
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_idea_st:{idea_id}:rejected"),
+                    InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"adm_idea_del:{idea_id}")
+                ]
+            ])
+            await send_admin_alert(
+                f"💡 <b>НОВАЯ ИДЕЯ ОТ ПОЛЬЗОВАТЕЛЯ!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>Автор:</b> {escape_html(author_name)} (<code>{sender_id}</code>)\n"
+                f"🆔 <b>ID идеи:</b> <code>{idea_id}</code>\n"
+                f"📌 <b>Заголовок:</b> <b>{escape_html(title)}</b>\n\n"
+                f"📝 <b>Описание:</b>\n{escape_html(description)}",
+                reply_markup=adm_kb
+            )
+            return
 
     # Check if user was entering a promo code
     if sender_id in _user_waiting_promo:
