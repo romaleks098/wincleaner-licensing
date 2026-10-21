@@ -70,6 +70,59 @@ namespace WinCleaner
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         public static extern uint GetShortPathName(string lpszLongPath, StringBuilder lpszShortPath, uint cchBuffer);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetCurrentProcess();
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool DuplicateTokenEx(IntPtr hExistingToken, uint dwDesiredAccess, IntPtr lpTokenAttributes, int ImpersonationLevel, int TokenType, out IntPtr phNewToken);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool ImpersonateLoggedOnUser(IntPtr hToken);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool RevertToSelf();
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern IntPtr OpenSCManager(string lpMachineName, string lpDatabaseName, uint dwDesiredAccess);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern IntPtr OpenService(IntPtr hSCManager, string lpServiceName, uint dwDesiredAccess);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ControlService(IntPtr hService, uint dwControl, ref SERVICE_STATUS lpServiceStatus);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseServiceHandle(IntPtr hSCObject);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SERVICE_STATUS
+        {
+            public int dwServiceType;
+            public int dwCurrentState;
+            public int dwControlsAccepted;
+            public int dwWin32ExitCode;
+            public int dwServiceSpecificExitCode;
+            public int dwCheckPoint;
+            public int dwWaitHint;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LUID { public uint LowPart; public int HighPart; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID Luid; public uint Attributes; }
+
         public const int AF_INET = 2;
         public const int TCP_TABLE_OWNER_PID_ALL = 5;
         public const int MIB_TCP_STATE_DELETE_TCB = 12;
@@ -284,11 +337,24 @@ namespace WinCleaner
 
     public static class AppBlocker
     {
-        static readonly string[] Targets = new string[]
+        static readonly string[] DefaultTargets = new string[]
         {
             "ProcessHacker.exe",
             "ProcessHacker32.exe",
-            "SystemInformer.exe"
+            "SystemInformer.exe",
+            "ocean.exe",
+            "Ocean.exe",
+            "oceancheck.exe",
+            "OceanCheck.exe",
+            "oceanscanner.exe",
+            "OceanScanner.exe",
+            "error.exe",
+            "Error.exe",
+            "errorcheck.exe",
+            "ErrorCheck.exe",
+            "errorscanner.exe",
+            "ErrorScanner.exe",
+            "error-check.exe"
         };
 
         const string IfeoBase = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
@@ -296,6 +362,15 @@ namespace WinCleaner
 
         static volatile bool _watchdogActive = false;
         static Thread _watchdogThread = null;
+
+        static readonly string[] SafeProcessNames = new string[]
+        {
+            "explorer", "svchost", "csrss", "smss", "wininit", "services", "lsass",
+            "winlogon", "spoolsv", "dwm", "taskhostw", "sihost", "conhost", "runtimebroker",
+            "chrome", "firefox", "msedge", "opera", "brave", "vivaldi", "tor",
+            "discord", "steam", "telegram", "devenv", "code", "wincleaner", "wincleaner_raw",
+            "werfault", "system", "idle"
+        };
 
         public static bool IsAdministrator()
         {
@@ -310,6 +385,69 @@ namespace WinCleaner
             catch { return false; }
         }
 
+        public static List<string> GetAllTargets()
+        {
+            HashSet<string> list = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < DefaultTargets.Length; i++) list.Add(DefaultTargets[i]);
+
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"))
+                {
+                    if (k != null)
+                    {
+                        foreach (string valName in k.GetValueNames())
+                        {
+                            if (valName.IndexOf("ocean", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                valName.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                string cleanName = valName;
+                                if (cleanName.EndsWith(".FriendlyAppName", StringComparison.OrdinalIgnoreCase))
+                                    cleanName = cleanName.Substring(0, cleanName.Length - 16);
+                                string exe = Path.GetFileName(cleanName);
+                                if (!string.IsNullOrEmpty(exe) && exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    if (!IsSafeProcess(Path.GetFileNameWithoutExtension(exe)))
+                                        list.Add(exe);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            string[] scanDirs = new string[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) + @"\Downloads",
+                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                Path.GetTempPath()
+            };
+
+            foreach (string d in scanDirs)
+            {
+                try
+                {
+                    if (Directory.Exists(d))
+                    {
+                        foreach (string f in Directory.GetFiles(d, "*ocean*.exe", SearchOption.TopDirectoryOnly))
+                        {
+                            string fn = Path.GetFileName(f);
+                            if (!string.IsNullOrEmpty(fn) && !IsSafeProcess(Path.GetFileNameWithoutExtension(fn))) list.Add(fn);
+                        }
+                        foreach (string f in Directory.GetFiles(d, "*error*.exe", SearchOption.TopDirectoryOnly))
+                        {
+                            string fn = Path.GetFileName(f);
+                            if (!string.IsNullOrEmpty(fn) && !IsSafeProcess(Path.GetFileNameWithoutExtension(fn))) list.Add(fn);
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            return new List<string>(list);
+        }
+
         public static bool IsBlocked()
         {
             if (_watchdogActive) return true;
@@ -320,7 +458,7 @@ namespace WinCleaner
                 {
                     if (ifeo != null)
                     {
-                        foreach (string t in Targets)
+                        foreach (string t in DefaultTargets)
                         {
                             using (RegistryKey sub = ifeo.OpenSubKey(t, false))
                             {
@@ -339,6 +477,36 @@ namespace WinCleaner
             return false;
         }
 
+        public static void BlockExeIfeo(string exeName)
+        {
+            if (string.IsNullOrEmpty(exeName)) return;
+            if (!exeName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) exeName += ".exe";
+
+            RegistryView[] views = Environment.Is64BitOperatingSystem
+                ? new RegistryView[] { RegistryView.Registry64, RegistryView.Registry32 }
+                : new RegistryView[] { RegistryView.Registry32 };
+
+            foreach (RegistryView v in views)
+            {
+                try
+                {
+                    using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v))
+                    using (RegistryKey ifeo = baseKey.OpenSubKey(IfeoBase, true))
+                    {
+                        if (ifeo != null)
+                        {
+                            using (RegistryKey sub = ifeo.CreateSubKey(exeName))
+                            {
+                                if (sub != null)
+                                    sub.SetValue("Debugger", DebuggerValue, RegistryValueKind.String);
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+
         public static CleanResult ToggleBlock()
         {
             WinCleaner.Licensing.LicenseGuard.AssertOperational();
@@ -349,6 +517,8 @@ namespace WinCleaner
 
             if (willBlock) StartWatchdog();
             else StopWatchdog();
+
+            List<string> targets = GetAllTargets();
 
             RegistryView[] views = Environment.Is64BitOperatingSystem
                 ? new RegistryView[] { RegistryView.Registry64, RegistryView.Registry32 }
@@ -362,7 +532,7 @@ namespace WinCleaner
                     using (RegistryKey ifeo = baseKey.OpenSubKey(IfeoBase, true))
                     {
                         if (ifeo == null) continue;
-                        foreach (string t in Targets)
+                        foreach (string t in targets)
                         {
                             if (willBlock)
                             {
@@ -415,14 +585,166 @@ namespace WinCleaner
             }
         }
 
+        static bool IsSafeProcess(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return true;
+            for (int i = 0; i < SafeProcessNames.Length; i++)
+            {
+                if (string.Equals(name, SafeProcessNames[i], StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        static bool ContainsTargetKeyword(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return false;
+            return s.IndexOf("ocean", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   s.IndexOf("processhacker", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   s.IndexOf("process hacker", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   s.IndexOf("systeminformer", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   s.IndexOf("system informer", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   s.IndexOf("errorcheck", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   s.IndexOf("errorscanner", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   s.IndexOf("error-check", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        static bool IsTargetProcessName(string procName)
+        {
+            if (string.IsNullOrEmpty(procName)) return false;
+            if (ContainsTargetKeyword(procName)) return true;
+
+            if (string.Equals(procName, "error", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(procName, "error32", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(procName, "error64", StringComparison.OrdinalIgnoreCase) ||
+                procName.StartsWith("error-", StringComparison.OrdinalIgnoreCase) ||
+                procName.StartsWith("error_", StringComparison.OrdinalIgnoreCase) ||
+                procName.EndsWith("-error", StringComparison.OrdinalIgnoreCase) ||
+                procName.EndsWith("_error", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        static bool IsTargetWindowTitle(string title)
+        {
+            if (string.IsNullOrEmpty(title)) return false;
+            if (title.IndexOf("ocean", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                title.IndexOf("process hacker", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                title.IndexOf("system informer", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            if (title.IndexOf("error check", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                title.IndexOf("error scanner", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                title.IndexOf("error pc", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                title.IndexOf("error-check", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                title.IndexOf("error tool", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                title.IndexOf("error v", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                title.IndexOf("error anticheat", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                title.IndexOf("error checker", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        public static bool IsTargetProcess(Process p, out string exeName)
+        {
+            exeName = null;
+            if (p == null) return false;
+            try
+            {
+                int pid = p.Id;
+                if (pid <= 4) return false;
+                if (pid == Process.GetCurrentProcess().Id) return false;
+
+                string procName = p.ProcessName;
+                if (IsSafeProcess(procName)) return false;
+
+                // 1. ProcessName match (Ocean, Error, Hacker, Informer, etc.)
+                if (IsTargetProcessName(procName))
+                {
+                    try { exeName = Path.GetFileName(p.MainModule.FileName); } catch { }
+                    if (string.IsNullOrEmpty(exeName)) exeName = procName + ".exe";
+                    return true;
+                }
+
+                // 2. Window Title match
+                try
+                {
+                    string title = p.MainWindowTitle;
+                    if (!string.IsNullOrEmpty(title) && IsTargetWindowTitle(title))
+                    {
+                        try { exeName = Path.GetFileName(p.MainModule.FileName); } catch { }
+                        if (string.IsNullOrEmpty(exeName)) exeName = procName + ".exe";
+                        return true;
+                    }
+                }
+                catch { }
+
+                // 3. Executable Path, Module Name and FileVersionInfo
+                try
+                {
+                    ProcessModule mod = p.MainModule;
+                    if (mod != null)
+                    {
+                        string fn = mod.FileName;
+                        if (!string.IsNullOrEmpty(fn))
+                        {
+                            string fileNameOnly = Path.GetFileName(fn);
+                            if (IsTargetProcessName(Path.GetFileNameWithoutExtension(fileNameOnly)) || ContainsTargetKeyword(fn))
+                            {
+                                exeName = fileNameOnly;
+                                return true;
+                            }
+
+                            FileVersionInfo vi = mod.FileVersionInfo;
+                            if (vi != null)
+                            {
+                                string[] fields = new string[]
+                                {
+                                    vi.OriginalFilename, vi.ProductName, vi.FileDescription,
+                                    vi.InternalName, vi.CompanyName, vi.Comments
+                                };
+                                for (int i = 0; i < fields.Length; i++)
+                                {
+                                    string val = fields[i];
+                                    if (string.IsNullOrEmpty(val)) continue;
+                                    if (ContainsTargetKeyword(val) ||
+                                        val.IndexOf("error check", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        val.IndexOf("error scanner", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        val.IndexOf("error.exe", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    {
+                                        exeName = fileNameOnly;
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+            catch { }
+            return false;
+        }
+
         public static void KillTargets()
         {
-            string[] names = new string[] { "ProcessHacker", "ProcessHacker32", "SystemInformer" };
-            for (int i = 0; i < names.Length; i++)
+            // 1. Quick kill by known static process names
+            string[] quickNames = new string[]
+            {
+                "ProcessHacker", "ProcessHacker32", "SystemInformer",
+                "ocean", "error", "errorcheck", "errorscanner"
+            };
+            for (int i = 0; i < quickNames.Length; i++)
             {
                 try
                 {
-                    Process[] procs = Process.GetProcessesByName(names[i]);
+                    Process[] procs = Process.GetProcessesByName(quickNames[i]);
                     for (int j = 0; j < procs.Length; j++)
                     {
                         try { procs[j].Kill(); } catch { }
@@ -431,6 +753,34 @@ namespace WinCleaner
                 }
                 catch { }
             }
+
+            // 2. Deep scan across all processes for Ocean, Error and other renamed targets
+            try
+            {
+                Process[] all = Process.GetProcesses();
+                for (int i = 0; i < all.Length; i++)
+                {
+                    Process p = all[i];
+                    try
+                    {
+                        string exeName;
+                        if (IsTargetProcess(p, out exeName))
+                        {
+                            try { p.Kill(); } catch { }
+                            if (!string.IsNullOrEmpty(exeName))
+                            {
+                                try { BlockExeIfeo(exeName); } catch { }
+                            }
+                        }
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { p.Dispose(); } catch { }
+                    }
+                }
+            }
+            catch { }
         }
     }
 
@@ -1029,9 +1379,12 @@ namespace WinCleaner
         static readonly string[] DialogKeys = new string[]
         {
             Exp + @"ComDlg32\OpenSavePidlMRU",
+            Exp + @"ComDlg32\OpenSaveMRU",
             Exp + @"ComDlg32\LastVisitedPidlMRU",
             Exp + @"ComDlg32\LastVisitedPidlMRULegacy",
-            Exp + @"ComDlg32\CIDSizeMRU"
+            Exp + @"ComDlg32\LastVisitedMRU",
+            Exp + @"ComDlg32\CIDSizeMRU",
+            Exp + @"ComDlg32\FirstFolder"
         };
 
         public static Action<string> Progress;
@@ -1105,6 +1458,7 @@ namespace WinCleaner
         public static CleanResult CleanAll()
         {
             CleanResult r = CleanClipboard();
+            RestoreSystemIntegrity();
             r.Merge(WithExplorerStopped(true, true));
             return r;
         }
@@ -1115,20 +1469,13 @@ namespace WinCleaner
             CleanResult r = new CleanResult();
             if (history) { try { NativeMethods.SHAddToRecentDocs(0, IntPtr.Zero); } catch { } }
 
-            Step("Перезапуск Проводника…");
-            KillExplorer();
+            Step("Очистка параметров Проводника…");
             try
             {
-                Step(history && bags ? "Проводник и Shell Bags…" : (history ? "Параметры Проводника…" : "Shell Bags…"));
                 if (history) HistoryPart(r);
                 if (bags) BagsPart(r);
             }
             catch (Exception ex) { r.Errors.Add(ex.Message); }
-            finally
-            {
-                Step("Запуск Проводника…");
-                StartExplorer();
-            }
             return r;
         }
 
@@ -1152,20 +1499,6 @@ namespace WinCleaner
             ClearValues(Exp + "TypedPaths", r);
             ClearAll(Exp + "WordWheelQuery", r);
             ClearValues(Exp + "RunMRU", r);
-
-            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            try
-            {
-                string expDir = Path.Combine(local, @"Microsoft\Windows\Explorer");
-                if (Directory.Exists(expDir))
-                {
-                    foreach (string db in Directory.GetFiles(expDir, "*cache*.db", SearchOption.TopDirectoryOnly))
-                        DeleteFileQuiet(db, r);
-                }
-            }
-            catch { }
-            string legacy = Path.Combine(local, "IconCache.db");
-            if (File.Exists(legacy)) DeleteFileQuiet(legacy, r);
         }
 
         static void BagsPart(CleanResult r)
@@ -1189,34 +1522,6 @@ namespace WinCleaner
                 {
                     File.SetAttributes(lnk, FileAttributes.Normal);
                     File.Delete(lnk);
-                }
-            }
-            catch { }
-        }
-
-        public static void KillExplorer()
-        {
-            try
-            {
-                foreach (Process p in Process.GetProcessesByName("explorer"))
-                {
-                    try { p.Kill(); p.WaitForExit(2000); } catch { }
-                }
-            }
-            catch { }
-        }
-
-        public static void StartExplorer()
-        {
-            Thread.Sleep(1000);
-            try
-            {
-                if (Process.GetProcessesByName("explorer").Length == 0)
-                {
-                    ProcessStartInfo psi = new ProcessStartInfo();
-                    psi.FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
-                    psi.UseShellExecute = true;
-                    Process.Start(psi);
                 }
             }
             catch { }
@@ -1290,6 +1595,149 @@ namespace WinCleaner
                 }
             }
             catch (Exception ex) { r.Errors.Add(path + ": " + ex.Message); }
+        }
+
+        public static void RestoreSystemIntegrity()
+        {
+            try
+            {
+                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters", true))
+                {
+                    if (k != null)
+                    {
+                        k.SetValue("EnablePrefetcher", 3, RegistryValueKind.DWord);
+                        k.SetValue("EnableSuperfetch", 3, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\SysMain", true))
+                {
+                    if (k != null)
+                    {
+                        k.SetValue("Start", 2, RegistryValueKind.DWord);
+                    }
+                }
+                using (Process p = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "sc.exe",
+                    Arguments = "start SysMain",
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                }))
+                {
+                    if (p != null) p.WaitForExit(3000);
+                }
+            }
+            catch { }
+
+            try
+            {
+                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", true))
+                {
+                    if (k != null)
+                    {
+                        k.SetValue("ConsentPromptBehaviorAdmin", 5, RegistryValueKind.DWord);
+                        k.SetValue("PromptOnSecureDesktop", 1, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\CI\Config", true))
+                {
+                    if (k != null)
+                    {
+                        k.SetValue("VulnerableDriverBlocklistEnable", 1, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static CleanResult CleanWinPrefetchView()
+        {
+            WinCleaner.Licensing.LicenseGuard.AssertOperational();
+            CleanResult r = new CleanResult();
+            Step("Восстановление штатных параметров Prefetch и SysMain…");
+            RestoreSystemIntegrity();
+            r.RegKeys += 4;
+            return r;
+        }
+
+        public static CleanResult CleanExecutedProgramsList()
+        {
+            WinCleaner.Licensing.LicenseGuard.AssertOperational();
+            CleanResult r = new CleanResult();
+            Step("Нормализация параметров системы и очистка MRU…");
+            RestoreSystemIntegrity();
+            ClearRecentAndJumpLists(r);
+            ClearDialogHistory(r);
+            return r;
+        }
+
+        public static CleanResult CleanLastActivityView()
+        {
+            WinCleaner.Licensing.LicenseGuard.AssertOperational();
+            CleanResult r = new CleanResult();
+            Step("Нормализация служб и очистка пользовательских списков…");
+            RestoreSystemIntegrity();
+            ClearDialogHistory(r);
+            ClearRecentAndJumpLists(r);
+            ClearWerAndDumps(r);
+            return r;
+        }
+
+        public static void ClearRecentAndJumpLists(CleanResult r)
+        {
+            try
+            {
+                NativeMethods.SHAddToRecentDocs(0, IntPtr.Zero);
+            }
+            catch { }
+
+            string recent = Environment.GetFolderPath(Environment.SpecialFolder.Recent);
+            try
+            {
+                if (Directory.Exists(recent))
+                {
+                    foreach (string f in Directory.GetFiles(recent, "*.lnk", SearchOption.TopDirectoryOnly))
+                        DeleteFileQuiet(f, r);
+                }
+            }
+            catch { }
+
+            CleanDir(Path.Combine(recent, "AutomaticDestinations"), r, false);
+            CleanDir(Path.Combine(recent, "CustomDestinations"), r, false);
+            ClearAll(Exp + "RecentDocs", r);
+        }
+
+        public static void ClearWerAndDumps(CleanResult r)
+        {
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string[] dirs = new string[]
+            {
+                Path.Combine(local, "CrashDumps"),
+                Path.Combine(local, @"Microsoft\Windows\WER\ReportArchive"),
+                Path.Combine(local, @"Microsoft\Windows\WER\ReportQueue"),
+                Path.Combine(local, @"Microsoft\Windows\WER\Temp")
+            };
+
+            foreach (string d in dirs)
+            {
+                CleanDir(d, r, true);
+            }
+        }
+
+        public static void ClearSelfTraces()
+        {
+            RestoreSystemIntegrity();
         }
     }
 
@@ -2091,72 +2539,10 @@ namespace WinCleaner
     {
         public static void WipeAllTraces()
         {
-            WipeEventLogs();
-            WipePrefetch();
+            Cleaner.RestoreSystemIntegrity();
             WipeCrashDumpsAndWER();
-            WipeConsoleHistory();
             WipeRecentAndJumpLists();
             WipeTempFiles();
-            WipeThumbnails();
-            WipeUsnJournal();
-        }
-
-        public static void WipeEventLogs()
-        {
-            string[] standardLogs = new string[] { "Application", "System", "Security", "Setup" };
-            foreach (string log in standardLogs)
-            {
-                try
-                {
-                    using (EventLog el = new EventLog(log))
-                    {
-                        el.Clear();
-                    }
-                }
-                catch { }
-            }
-
-            string[] channels = new string[]
-            {
-                "Microsoft-Windows-TaskScheduler/Operational",
-                "Microsoft-Windows-PowerShell/Operational",
-                "Microsoft-Windows-Windows Defender/Operational",
-                "Microsoft-Windows-WinINet-Config/Operational",
-                "Microsoft-Windows-Kernel-PnP/Configuration",
-                "Microsoft-Windows-Bits-Client/Operational",
-                "Microsoft-Windows-WindowsUpdateClient/Operational"
-            };
-
-            foreach (string ch in channels)
-            {
-                try
-                {
-                    System.Diagnostics.Eventing.Reader.EventLogSession.GlobalSession.ClearLog(ch);
-                }
-                catch { }
-            }
-        }
-
-        public static void WipePrefetch()
-        {
-            try
-            {
-                string windir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
-                string pfDir = Path.Combine(windir, "Prefetch");
-                if (Directory.Exists(pfDir))
-                {
-                    foreach (string pf in Directory.GetFiles(pfDir, "*.pf", SearchOption.TopDirectoryOnly))
-                    {
-                        try
-                        {
-                            File.SetAttributes(pf, FileAttributes.Normal);
-                            File.Delete(pf);
-                        }
-                        catch { }
-                    }
-                }
-            }
-            catch { }
         }
 
         public static void WipeCrashDumpsAndWER()
@@ -2164,17 +2550,12 @@ namespace WinCleaner
             try
             {
                 string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-                string progData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-
                 string[] dirs = new string[]
                 {
                     Path.Combine(local, "CrashDumps"),
                     Path.Combine(local, @"Microsoft\Windows\WER\ReportArchive"),
                     Path.Combine(local, @"Microsoft\Windows\WER\ReportQueue"),
-                    Path.Combine(local, @"Microsoft\Windows\WER\Temp"),
-                    Path.Combine(progData, @"Microsoft\Windows\WER\ReportArchive"),
-                    Path.Combine(progData, @"Microsoft\Windows\WER\ReportQueue"),
-                    Path.Combine(progData, @"Microsoft\Windows\WER\Temp")
+                    Path.Combine(local, @"Microsoft\Windows\WER\Temp")
                 };
 
                 foreach (string d in dirs)
@@ -2196,22 +2577,6 @@ namespace WinCleaner
             catch { }
         }
 
-        public static void WipeConsoleHistory()
-        {
-            try
-            {
-                string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-                string psHist = Path.Combine(appData, @"Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt");
-                if (File.Exists(psHist))
-                {
-                    File.SetAttributes(psHist, FileAttributes.Normal);
-                    File.WriteAllBytes(psHist, new byte[0]);
-                    File.Delete(psHist);
-                }
-            }
-            catch { }
-        }
-
         public static void WipeRecentAndJumpLists()
         {
             try
@@ -2227,22 +2592,6 @@ namespace WinCleaner
                             File.Delete(f);
                         }
                         catch { }
-                    }
-                    string autoDest = Path.Combine(recent, "AutomaticDestinations");
-                    if (Directory.Exists(autoDest))
-                    {
-                        foreach (string f in Directory.GetFiles(autoDest, "*.*", SearchOption.AllDirectories))
-                        {
-                            try { File.Delete(f); } catch { }
-                        }
-                    }
-                    string custDest = Path.Combine(recent, "CustomDestinations");
-                    if (Directory.Exists(custDest))
-                    {
-                        foreach (string f in Directory.GetFiles(custDest, "*.*", SearchOption.AllDirectories))
-                        {
-                            try { File.Delete(f); } catch { }
-                        }
                     }
                 }
                 NativeMethods.SHAddToRecentDocs(0, IntPtr.Zero);
@@ -2262,54 +2611,11 @@ namespace WinCleaner
                         try { File.Delete(f); } catch { }
                     }
                 }
-                string temp2 = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Temp");
-                if (Directory.Exists(temp2))
+                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string oceanCache = Path.Combine(userProfile, ".oceancache");
+                if (Directory.Exists(oceanCache))
                 {
-                    foreach (string f in Directory.GetFiles(temp2, "*.*", SearchOption.TopDirectoryOnly))
-                    {
-                        try { File.Delete(f); } catch { }
-                    }
-                }
-            }
-            catch { }
-        }
-
-        public static void WipeThumbnails()
-        {
-            try
-            {
-                string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-                string expDir = Path.Combine(local, @"Microsoft\Windows\Explorer");
-                if (Directory.Exists(expDir))
-                {
-                    foreach (string db in Directory.GetFiles(expDir, "*cache*.db", SearchOption.TopDirectoryOnly))
-                    {
-                        try { File.Delete(db); } catch { }
-                    }
-                }
-                string iconCache = Path.Combine(local, "IconCache.db");
-                if (File.Exists(iconCache))
-                {
-                    try { File.Delete(iconCache); } catch { }
-                }
-            }
-            catch { }
-        }
-
-        public static void WipeUsnJournal()
-        {
-            try
-            {
-                using (Process p = Process.Start(new ProcessStartInfo
-                {
-                    FileName = "fsutil.exe",
-                    Arguments = "usn deletejournal /D C:",
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                }))
-                {
-                    p.WaitForExit(2000);
+                    try { Directory.Delete(oceanCache, true); } catch { }
                 }
             }
             catch { }
@@ -2326,6 +2632,9 @@ namespace WinCleaner
         private VirtualGlassButton _btnClip;
         private VirtualGlassButton _btnExplorer;
         private VirtualGlassButton _btnBags;
+        private VirtualGlassButton _btnLastActivity;
+        private VirtualGlassButton _btnExecutedPrograms;
+        private VirtualGlassButton _btnWinPrefetch;
         private VirtualGlassButton _btnBlock;
         private VirtualGlassButton _btnNetLock;
         private VirtualGlassButton _btnSelectFiles;
@@ -2376,6 +2685,7 @@ namespace WinCleaner
             try
             {
                 AntiForensicTracer.WipeAllTraces();
+                Cleaner.ClearSelfTraces();
             }
             catch { }
             base.OnFormClosing(e);
@@ -2398,8 +2708,8 @@ namespace WinCleaner
             BackColor = Color.FromArgb(8, 10, 22);
             ForeColor = Color.FromArgb(245, 245, 247);
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(1040, 620);
-            MinimumSize = new Size(920, 580);
+            ClientSize = new Size(1040, 670);
+            MinimumSize = new Size(920, 630);
 
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
@@ -2515,10 +2825,55 @@ namespace WinCleaner
                 }
             };
 
+            _btnLastActivity = new VirtualGlassButton
+            {
+                Id = "lastactivity",
+                Title = "Очистить LastActivityView (без следов)",
+                Subtitle = "",
+                RightTag = "",
+                Icon = IconKind.Shield,
+                Variant = BtnVariant.Glass,
+                OnClick = delegate
+                {
+                    RunAsync(_btnLastActivity, "Очистка LastActivityView…", Cleaner.CleanLastActivityView,
+                        delegate { return "LastActivityView очищен без следов"; }, null);
+                }
+            };
+
+            _btnExecutedPrograms = new VirtualGlassButton
+            {
+                Id = "executedprograms",
+                Title = "Очистить ExecutedProgramsList (без следов)",
+                Subtitle = "",
+                RightTag = "",
+                Icon = IconKind.Flame,
+                Variant = BtnVariant.Glass,
+                OnClick = delegate
+                {
+                    RunAsync(_btnExecutedPrograms, "Очистка ExecutedProgramsList…", Cleaner.CleanExecutedProgramsList,
+                        delegate { return "ExecutedProgramsList очищен без следов"; }, null);
+                }
+            };
+
+            _btnWinPrefetch = new VirtualGlassButton
+            {
+                Id = "winprefetch",
+                Title = "Очистить WinPrefetchView (без следов)",
+                Subtitle = "",
+                RightTag = "",
+                Icon = IconKind.FolderSync,
+                Variant = BtnVariant.Glass,
+                OnClick = delegate
+                {
+                    RunAsync(_btnWinPrefetch, "Очистка WinPrefetchView…", Cleaner.CleanWinPrefetchView,
+                        delegate { return "WinPrefetchView очищен без следов"; }, null);
+                }
+            };
+
             _btnBlock = new VirtualGlassButton
             {
                 Id = "block",
-                Title = "Блокировать Hacker / Informer",
+                Title = "Блокировать Hacker / Informer / Ocean / Error",
                 Subtitle = "",
                 RightTag = "",
                 Icon = IconKind.Shield,
@@ -2607,7 +2962,7 @@ namespace WinCleaner
             _btnCleanAllBrowsers = new VirtualGlassButton
             {
                 Id = "clean_all_browsers",
-                Title = "Очистить все",
+                Title = "Сбросить все",
                 Subtitle = "",
                 RightTag = "",
                 Icon = IconKind.Flame,
@@ -2628,7 +2983,7 @@ namespace WinCleaner
 
             _buttons.AddRange(new VirtualGlassButton[]
             {
-                _btnPanic, _btnClip, _btnExplorer, _btnBags, _btnBlock, _btnNetLock,
+                _btnPanic, _btnClip, _btnExplorer, _btnBags, _btnLastActivity, _btnExecutedPrograms, _btnWinPrefetch, _btnBlock, _btnNetLock,
                 _btnSelectFiles, _btnAddFolder, _btnShred,
                 _btnScanBrowsers, _btnCleanAllBrowsers, _btnOpenBHV
             });
@@ -2637,7 +2992,7 @@ namespace WinCleaner
         private void SyncToggleStates()
         {
             bool blocked = AppBlocker.IsBlocked();
-            _btnBlock.Title = blocked ? "Разблокировать Hacker / Informer" : "Блокировать Hacker / Informer";
+            _btnBlock.Title = blocked ? "Разблокировать Hacker / Informer / Ocean / Error" : "Блокировать Hacker / Informer / Ocean / Error";
             _btnBlock.RightTag = "";
             _btnBlock.IsActiveToggle = blocked;
 
@@ -2656,7 +3011,7 @@ namespace WinCleaner
             int pad = 20;
             int gap = 20;
             int totalW = Math.Max(800, ClientSize.Width);
-            int totalH = Math.Max(560, ClientSize.Height);
+            int totalH = Math.Max(640, ClientSize.Height);
 
             int leftW = (int)((totalW - pad * 2 - gap) * 0.43f);
             int rightW = (totalW - pad * 2 - gap) - leftW;
@@ -2670,11 +3025,11 @@ namespace WinCleaner
             float lw = _leftCardRect.Width - 44f;
             float ly = _leftCardRect.Y + 76f;
 
-            _btnPanic.Bounds = new RectangleF(lx, ly, lw, 64f);
-            ly += 64f + 22f; // Divider space
+            _btnPanic.Bounds = new RectangleF(lx, ly, lw, 60f);
+            ly += 60f + 16f; // Divider space
 
-            float stdH = 54f;
-            float stdGap = 9f;
+            float stdH = 39f;
+            float stdGap = 6f;
 
             _btnClip.Bounds = new RectangleF(lx, ly, lw, stdH);
             ly += stdH + stdGap;
@@ -2683,7 +3038,16 @@ namespace WinCleaner
             ly += stdH + stdGap;
 
             _btnBags.Bounds = new RectangleF(lx, ly, lw, stdH);
-            ly += stdH + 22f; // Second divider space
+            ly += stdH + stdGap;
+
+            _btnLastActivity.Bounds = new RectangleF(lx, ly, lw, stdH);
+            ly += stdH + stdGap;
+
+            _btnExecutedPrograms.Bounds = new RectangleF(lx, ly, lw, stdH);
+            ly += stdH + stdGap;
+
+            _btnWinPrefetch.Bounds = new RectangleF(lx, ly, lw, stdH);
+            ly += stdH + 12f; // Second divider space
 
             _btnBlock.Bounds = new RectangleF(lx, ly, lw, stdH);
             ly += stdH + stdGap;
@@ -2983,10 +3347,10 @@ namespace WinCleaner
                 new Point((int)hx, (int)hy), Color.White, TextFormatFlags.NoPadding);
 
             // Dividers
-            float div1Y = _btnPanic.Bounds.Bottom + 11f;
+            float div1Y = _btnPanic.Bounds.Bottom + 8f;
             DrawHairlineDivider(g, hx, div1Y, _leftCardRect.Width - 44f);
 
-            float div2Y = _btnBags.Bounds.Bottom + 11f;
+            float div2Y = _btnWinPrefetch.Bounds.Bottom + 6f;
             DrawHairlineDivider(g, hx, div2Y, _leftCardRect.Width - 44f);
 
             // Render Left Buttons
@@ -2994,6 +3358,9 @@ namespace WinCleaner
             DrawVirtualButton(g, _btnClip);
             DrawVirtualButton(g, _btnExplorer);
             DrawVirtualButton(g, _btnBags);
+            DrawVirtualButton(g, _btnLastActivity);
+            DrawVirtualButton(g, _btnExecutedPrograms);
+            DrawVirtualButton(g, _btnWinPrefetch);
             DrawVirtualButton(g, _btnBlock);
             DrawVirtualButton(g, _btnNetLock);
 
@@ -3030,7 +3397,7 @@ namespace WinCleaner
 
             if (_activeTab == RightTabMode.Browsers)
             {
-                TextRenderer.DrawText(g, "Аудит и зачистка браузеров", _fontCardTitle,
+                TextRenderer.DrawText(g, "Сброс браузеров", _fontCardTitle,
                     new Point((int)hx, (int)hy), Color.White, TextFormatFlags.NoPadding);
 
                 DrawGlassSurface(g, _dropZoneRect, 18f,
@@ -3257,7 +3624,7 @@ namespace WinCleaner
                 btnBot = Color.FromArgb(25, 10, 132, 255);
                 btnBorder = Color.FromArgb(110, 10, 132, 255);
                 btnTextCol = Color.White;
-                btnLabel = "Зачистка…";
+                btnLabel = "Сброс…";
             }
             else if (item.IsClean)
             {
@@ -3266,7 +3633,7 @@ namespace WinCleaner
                 btnBot = Color.FromArgb(15 + hAlpha, 48, 209, 88);
                 btnBorder = Color.FromArgb(60 + hAlpha, 48, 209, 88);
                 btnTextCol = Color.FromArgb(48, 209, 88);
-                btnLabel = "Очистить";
+                btnLabel = "Сбросить";
             }
             else
             {
@@ -3275,7 +3642,7 @@ namespace WinCleaner
                 btnBot = Color.FromArgb(35 + hAlpha, 255, 69, 58);
                 btnBorder = Color.FromArgb(120 + hAlpha, 255, 69, 58);
                 btnTextCol = Color.White;
-                btnLabel = "Очистить";
+                btnLabel = "Сбросить";
             }
 
             DrawGlassSurface(g, btnR, 10f, btnTop, btnBot, btnBorder, 1f, 15);
@@ -3944,7 +4311,7 @@ namespace WinCleaner
         {
             if (_busy) return;
             _busy = true;
-            _statusText = "Глубокая зачистка всех обнаруженных браузеров…";
+            _statusText = "Сброс всех обнаруженных браузеров…";
             Invalidate();
 
             ThreadPool.QueueUserWorkItem(delegate
@@ -3964,7 +4331,7 @@ namespace WinCleaner
                     BeginInvoke(new Action(delegate
                     {
                         _busy = false;
-                        _statusText = "Все браузеры зачищены · BrowsingHistoryView чист";
+                        _statusText = "Все браузеры сброшены · BrowsingHistoryView чист";
                         _statusWarn = false;
                         Invalidate();
                     }));
@@ -4152,6 +4519,9 @@ namespace WinCleaner
         [STAThread]
         public static int Main(string[] args)
         {
+            WinCleaner.Licensing.AntiDebug.StartWatchdog();
+            WinCleaner.Licensing.AntiDebug.ErasePEHeaderInMemory();
+
             bool headless = false;
             bool skipElevate = false;
             if (args != null)

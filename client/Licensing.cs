@@ -310,22 +310,43 @@ namespace WinCleaner.Licensing
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool IsDebuggerPresent();
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+
         private static readonly string[] BlacklistedTools = new string[]
         {
-            "dnspy", "dnspy-x86", "de4dot", "ilspy", "x64dbg", "x32dbg",
-            "ida", "ida64", "idag", "idag64", "idaw", "idaw64",
+            "dnspy", "dnspy-x86", "de4dot", "ilspy", "x64dbg", "x32dbg", "ollydbg",
+            "ida", "ida64", "idag", "idag64", "idaw", "idaw64", "ghidra",
             "cheatengine-x86_64", "cheatengine-i386", "cheatengine",
             "scylla", "scylla_x64", "scylla_x86", "charles", "fiddler",
-            "httpdebuggerui", "httpdebugger", "wireshark", "processhacker"
+            "httpdebuggerui", "httpdebugger", "wireshark", "processhacker",
+            "megadumper", "extremedumper", "procmon", "procexp", "simpleassemblyexplorer"
         };
 
         private static Thread _watchdogThread;
         private static volatile bool _watchdogStarted = false;
 
+        public static void ErasePEHeaderInMemory()
+        {
+            try
+            {
+                IntPtr baseAddress = Process.GetCurrentProcess().MainModule.BaseAddress;
+                uint oldProtect;
+                if (VirtualProtect(baseAddress, (UIntPtr)4096, 0x04 /* PAGE_READWRITE */, out oldProtect))
+                {
+                    byte[] zeros = new byte[4096];
+                    Marshal.Copy(zeros, 0, baseAddress, 4096);
+                    VirtualProtect(baseAddress, (UIntPtr)4096, oldProtect, out oldProtect);
+                }
+            }
+            catch { }
+        }
+
         public static void StartWatchdog()
         {
             if (_watchdogStarted) return;
             _watchdogStarted = true;
+            ErasePEHeaderInMemory();
             _watchdogThread = new Thread(WatchdogLoop)
             {
                 IsBackground = true,
@@ -350,7 +371,7 @@ namespace WinCleaner.Licensing
                 }
                 catch { }
 
-                Thread.Sleep(rng.Next(3000, 5000));
+                Thread.Sleep(rng.Next(1500, 3000));
             }
         }
 
@@ -491,6 +512,49 @@ namespace WinCleaner.Licensing
             {
                 Process.GetCurrentProcess().Kill();
                 throw new InvalidOperationException("Операция заблокирована: требуется действующая цифровая лицензия WinCleaner.");
+            }
+        }
+
+        public static byte[] DecryptPayload(byte[] cipherData)
+        {
+            if (_sessionToken == null || _sessionToken.Length != 32 || _guardState != ValidMagic)
+            {
+                Process.GetCurrentProcess().Kill();
+                return new byte[0];
+            }
+
+            if (!IsOperational())
+            {
+                Process.GetCurrentProcess().Kill();
+                return new byte[0];
+            }
+
+            try
+            {
+                using (RijndaelManaged aes = new RijndaelManaged())
+                {
+                    aes.KeySize = 256;
+                    aes.BlockSize = 128;
+                    aes.Mode = CipherMode.CBC;
+                    aes.Padding = PaddingMode.PKCS7;
+                    aes.Key = _sessionToken;
+
+                    byte[] iv = new byte[16];
+                    byte[] actualCipher = new byte[cipherData.Length - 16];
+                    Buffer.BlockCopy(cipherData, 0, iv, 0, 16);
+                    Buffer.BlockCopy(cipherData, 16, actualCipher, 0, actualCipher.Length);
+                    aes.IV = iv;
+
+                    using (ICryptoTransform decryptor = aes.CreateDecryptor())
+                    {
+                        return decryptor.TransformFinalBlock(actualCipher, 0, actualCipher.Length);
+                    }
+                }
+            }
+            catch
+            {
+                Process.GetCurrentProcess().Kill();
+                return new byte[0];
             }
         }
     }
