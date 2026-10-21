@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -1489,7 +1489,8 @@ namespace WinCleaner
         Flame,
         FileDoc,
         Trash,
-        CheckCircle
+        CheckCircle,
+        Globe
     }
 
     public enum BtnVariant
@@ -1547,6 +1548,517 @@ namespace WinCleaner
         public float DeleteHoverMix = 0f;
     }
 
+    public class BrowserItem
+    {
+        public string Id;
+        public string Name;
+        public string ProcessName;
+        public string UserDataPath;
+        public bool IsFirefox;
+        public bool IsPresent;
+        public bool IsClean;
+        public string StatusDetail;
+        public RectangleF RowBounds;
+        public RectangleF IndicatorBounds;
+        public RectangleF ActionBtnBounds;
+        public float HoverMix = 0f;
+        public float BtnHoverMix = 0f;
+        public bool IsCleaning = false;
+    }
+
+    public static class BrowserScanner
+    {
+        public static List<BrowserItem> DetectInstalledBrowsers()
+        {
+            var list = new List<BrowserItem>();
+            string localApp = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+
+            // 1. Google Chrome
+            string chromePath = Path.Combine(localApp, @"Google\Chrome\User Data");
+            if (Directory.Exists(chromePath))
+                list.Add(new BrowserItem { Id = "chrome", Name = "Google Chrome", ProcessName = "chrome", UserDataPath = chromePath, IsFirefox = false, IsPresent = true });
+
+            // 2. Microsoft Edge & Windows WebCache
+            string edgePath = Path.Combine(localApp, @"Microsoft\Edge\User Data");
+            string wcDir = Path.Combine(localApp, @"Microsoft\Windows\WebCache");
+            if (Directory.Exists(edgePath) || Directory.Exists(wcDir))
+                list.Add(new BrowserItem { Id = "edge", Name = "Microsoft Edge", ProcessName = "msedge", UserDataPath = edgePath, IsFirefox = false, IsPresent = true });
+
+            // 3. Mozilla Firefox
+            string ffPath = Path.Combine(appData, @"Mozilla\Firefox\Profiles");
+            if (Directory.Exists(ffPath))
+                list.Add(new BrowserItem { Id = "firefox", Name = "Mozilla Firefox", ProcessName = "firefox", UserDataPath = ffPath, IsFirefox = true, IsPresent = true });
+
+            // 4. Opera
+            string operaPath = Path.Combine(appData, @"Opera Software\Opera Stable");
+            if (Directory.Exists(operaPath))
+                list.Add(new BrowserItem { Id = "opera", Name = "Opera", ProcessName = "opera", UserDataPath = operaPath, IsFirefox = false, IsPresent = true });
+
+            // 5. Opera GX
+            string operaGxPath = Path.Combine(appData, @"Opera Software\Opera GX Stable");
+            if (Directory.Exists(operaGxPath))
+                list.Add(new BrowserItem { Id = "operagx", Name = "Opera GX", ProcessName = "opera", UserDataPath = operaGxPath, IsFirefox = false, IsPresent = true });
+
+            // 6. Yandex Browser
+            string yandexPath = Path.Combine(localApp, @"Yandex\YandexBrowser\User Data");
+            if (Directory.Exists(yandexPath))
+                list.Add(new BrowserItem { Id = "yandex", Name = "Yandex Browser", ProcessName = "browser", UserDataPath = yandexPath, IsFirefox = false, IsPresent = true });
+
+            // 7. Brave
+            string bravePath = Path.Combine(localApp, @"BraveSoftware\Brave-Browser\User Data");
+            if (Directory.Exists(bravePath))
+                list.Add(new BrowserItem { Id = "brave", Name = "Brave Browser", ProcessName = "brave", UserDataPath = bravePath, IsFirefox = false, IsPresent = true });
+
+            // 8. Vivaldi
+            string vivaldiPath = Path.Combine(localApp, @"Vivaldi\User Data");
+            if (Directory.Exists(vivaldiPath))
+                list.Add(new BrowserItem { Id = "vivaldi", Name = "Vivaldi", ProcessName = "vivaldi", UserDataPath = vivaldiPath, IsFirefox = false, IsPresent = true });
+
+            foreach (var b in list)
+            {
+                CheckBrowserClean(b);
+            }
+
+            return list;
+        }
+
+        public static bool CheckBrowserClean(BrowserItem b)
+        {
+            try
+            {
+                if (b.IsFirefox)
+                {
+                    if (!Directory.Exists(b.UserDataPath)) return true;
+                    string[] profiles = Directory.GetDirectories(b.UserDataPath);
+                    foreach (string p in profiles)
+                    {
+                        string places = Path.Combine(p, "places.sqlite");
+                        if (File.Exists(places) && new FileInfo(places).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                        string placesWal = Path.Combine(p, "places.sqlite-wal");
+                        if (File.Exists(placesWal) && new FileInfo(placesWal).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                        string cookies = Path.Combine(p, "cookies.sqlite");
+                        if (File.Exists(cookies) && new FileInfo(cookies).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                        string logins = Path.Combine(p, "logins.json");
+                        if (File.Exists(logins) && new FileInfo(logins).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                    }
+                    b.IsClean = true;
+                    return true;
+                }
+                else
+                {
+                    if (b.Id == "edge")
+                    {
+                        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                        string wcFile = Path.Combine(local, @"Microsoft\Windows\WebCache\WebCacheV01.dat");
+                        if (File.Exists(wcFile) && new FileInfo(wcFile).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                    }
+
+                    if (!Directory.Exists(b.UserDataPath))
+                    {
+                        b.IsClean = true;
+                        return true;
+                    }
+
+                    List<string> profileDirs = new List<string>();
+                    string defaultDir = Path.Combine(b.UserDataPath, "Default");
+                    if (Directory.Exists(defaultDir)) profileDirs.Add(defaultDir);
+
+                    try
+                    {
+                        foreach (string sub in Directory.GetDirectories(b.UserDataPath, "Profile *"))
+                            profileDirs.Add(sub);
+                    }
+                    catch { }
+
+                    profileDirs.Add(b.UserDataPath);
+
+                    foreach (string p in profileDirs)
+                    {
+                        string hist = Path.Combine(p, "History");
+                        if (File.Exists(hist) && new FileInfo(hist).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                        string histWal = Path.Combine(p, "History-wal");
+                        if (File.Exists(histWal) && new FileInfo(histWal).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                        string visited = Path.Combine(p, "Visited Links");
+                        if (File.Exists(visited) && new FileInfo(visited).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                        string login = Path.Combine(p, "Login Data");
+                        if (File.Exists(login) && new FileInfo(login).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                        string cook = Path.Combine(p, "Network", "Cookies");
+                        if (File.Exists(cook) && new FileInfo(cook).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                        string cookRoot = Path.Combine(p, "Cookies");
+                        if (File.Exists(cookRoot) && new FileInfo(cookRoot).Length > 0)
+                        {
+                            b.IsClean = false;
+                            return false;
+                        }
+                    }
+
+                    b.IsClean = true;
+                    return true;
+                }
+            }
+            catch
+            {
+                b.IsClean = false;
+                return false;
+            }
+        }
+
+        private static void KillProcessTree(string procName)
+        {
+            if (string.IsNullOrEmpty(procName)) return;
+            try
+            {
+                using (Process p = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "taskkill.exe",
+                    Arguments = string.Format("/F /T /IM {0}.exe", procName),
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                }))
+                {
+                    p.WaitForExit(2000);
+                }
+            }
+            catch
+            {
+                foreach (var proc in Process.GetProcessesByName(procName))
+                {
+                    try { proc.Kill(); } catch { }
+                }
+            }
+        }
+
+        public static void StopWininetCacheTask()
+        {
+            try
+            {
+                using (Process p = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "schtasks.exe",
+                    Arguments = @"/End /TN \Microsoft\Windows\Wininet\CacheTask",
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                }))
+                {
+                    p.WaitForExit(2000);
+                }
+            }
+            catch { }
+        }
+
+        public static void CleanWindowsWebCache()
+        {
+            StopWininetCacheTask();
+            Thread.Sleep(300);
+
+            try
+            {
+                string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                string webCache = Path.Combine(local, @"Microsoft\Windows\WebCache");
+                if (Directory.Exists(webCache))
+                {
+                    foreach (string wf in Directory.GetFiles(webCache, "*.*", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            File.SetAttributes(wf, FileAttributes.Normal);
+                            File.Delete(wf);
+                        }
+                        catch { }
+                    }
+                }
+                string inetCache = Path.Combine(local, @"Microsoft\Windows\INetCache");
+                if (Directory.Exists(inetCache))
+                {
+                    foreach (string inf in Directory.GetFiles(inetCache, "*.*", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            File.SetAttributes(inf, FileAttributes.Normal);
+                            File.Delete(inf);
+                        }
+                        catch { }
+                    }
+                }
+                string inetCookies = Path.Combine(local, @"Microsoft\Windows\INetCookies");
+                if (Directory.Exists(inetCookies))
+                {
+                    foreach (string ic in Directory.GetFiles(inetCookies, "*.*", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            File.SetAttributes(ic, FileAttributes.Normal);
+                            File.Delete(ic);
+                        }
+                        catch { }
+                    }
+                }
+                string histFolder = Path.Combine(local, @"Microsoft\Windows\History");
+                if (Directory.Exists(histFolder))
+                {
+                    foreach (string hf in Directory.GetFiles(histFolder, "*.*", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            File.SetAttributes(hf, FileAttributes.Normal);
+                            File.Delete(hf);
+                        }
+                        catch { }
+                    }
+                }
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Internet Explorer\TypedURLs", true))
+                {
+                    if (key != null)
+                    {
+                        foreach (var val in key.GetValueNames())
+                        {
+                            try { key.DeleteValue(val, false); } catch { }
+                        }
+                    }
+                }
+                using (var key2 = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Internet Explorer\TypedURLsTime", true))
+                {
+                    if (key2 != null)
+                    {
+                        foreach (var val in key2.GetValueNames())
+                        {
+                            try { key2.DeleteValue(val, false); } catch { }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static void CleanBrowser(BrowserItem b)
+        {
+            WinCleaner.Licensing.LicenseGuard.AssertOperational();
+
+            try
+            {
+                if (!string.IsNullOrEmpty(b.ProcessName))
+                {
+                    KillProcessTree(b.ProcessName);
+                }
+
+                if (b.IsFirefox)
+                {
+                    KillProcessTree("firefox");
+                    KillProcessTree("pingsender");
+                    KillProcessTree("default-browser-agent");
+                    KillProcessTree("plugin-container");
+                }
+                else if (b.Id == "edge")
+                {
+                    KillProcessTree("msedge");
+                    KillProcessTree("msedgewebview2");
+                    CleanWindowsWebCache();
+                }
+                else if (b.Id == "chrome")
+                {
+                    KillProcessTree("chrome");
+                    KillProcessTree("chrome_crashpad_handler");
+                }
+                else if (b.Id == "opera" || b.Id == "operagx")
+                {
+                    KillProcessTree("opera");
+                    KillProcessTree("opera_crashreporter");
+                    KillProcessTree("opera_autoupdate");
+                }
+                else if (b.Id == "brave")
+                {
+                    KillProcessTree("brave");
+                    KillProcessTree("brave_crashpad_handler");
+                }
+                else if (b.Id == "yandex")
+                {
+                    KillProcessTree("browser");
+                    KillProcessTree("yandex");
+                }
+                else if (b.Id == "vivaldi")
+                {
+                    KillProcessTree("vivaldi");
+                }
+            }
+            catch { }
+
+            Thread.Sleep(400);
+
+            if (b.IsFirefox)
+            {
+                CleanFirefoxProfileDirs(b.UserDataPath);
+                string localFf = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Mozilla\Firefox\Profiles");
+                if (Directory.Exists(localFf)) CleanFirefoxProfileDirs(localFf);
+            }
+            else
+            {
+                CleanChromiumUserData(b.UserDataPath, b.Id == "edge");
+            }
+
+            CheckBrowserClean(b);
+        }
+
+        private static void CleanChromiumUserData(string rootPath, bool isEdge)
+        {
+            if (Directory.Exists(rootPath))
+            {
+                List<string> profileDirs = new List<string>();
+                string defaultDir = Path.Combine(rootPath, "Default");
+                if (Directory.Exists(defaultDir)) profileDirs.Add(defaultDir);
+
+                try
+                {
+                    foreach (string sub in Directory.GetDirectories(rootPath, "Profile *"))
+                        profileDirs.Add(sub);
+                }
+                catch { }
+
+                profileDirs.Add(rootPath);
+
+                string[] targetFiles = new string[]
+                {
+                    "History", "History-journal", "History-wal", "History-shm",
+                    "Visited Links", "Top Sites", "Top Sites-journal",
+                    "Favicons", "Favicons-journal", "Shortcuts", "Shortcuts-journal",
+                    "Cookies", "Cookies-journal",
+                    "Login Data", "Login Data-journal", "Login Data For Account",
+                    "Web Data", "Web Data-journal",
+                    "Current Session", "Current Tabs", "Last Session", "Last Tabs"
+                };
+
+                string[] targetSubDirs = new string[]
+                {
+                    "Sessions", "Cache", "Code Cache", "GPUCache", "DawnCache",
+                    "ShaderCache", "GrShaderCache", "IndexedDB", "Local Storage",
+                    "Session Storage", "Service Worker", "CacheStorage",
+                    "Sync Data", "Sync Data Backup", "Extension State"
+                };
+
+                foreach (string p in profileDirs)
+                {
+                    foreach (string f in targetFiles)
+                    {
+                        try
+                        {
+                            string fp = Path.Combine(p, f);
+                            if (File.Exists(fp)) File.Delete(fp);
+                        }
+                        catch { }
+                    }
+
+                    try
+                    {
+                        string netCook = Path.Combine(p, "Network", "Cookies");
+                        if (File.Exists(netCook)) File.Delete(netCook);
+                        string netCookJ = Path.Combine(p, "Network", "Cookies-journal");
+                        if (File.Exists(netCookJ)) File.Delete(netCookJ);
+                    }
+                    catch { }
+
+                    foreach (string sd in targetSubDirs)
+                    {
+                        try
+                        {
+                            string sdp = Path.Combine(p, sd);
+                            if (Directory.Exists(sdp)) Directory.Delete(sdp, true);
+                        }
+                        catch { }
+                    }
+                }
+            }
+
+            if (isEdge)
+            {
+                CleanWindowsWebCache();
+            }
+        }
+
+        private static void CleanFirefoxProfileDirs(string rootPath)
+        {
+            if (!Directory.Exists(rootPath)) return;
+            string[] profiles;
+            try { profiles = Directory.GetDirectories(rootPath); } catch { return; }
+
+            string[] targetFiles = new string[]
+            {
+                "places.sqlite", "places.sqlite-wal", "places.sqlite-shm",
+                "favicons.sqlite", "favicons.sqlite-wal", "favicons.sqlite-shm",
+                "formhistory.sqlite", "cookies.sqlite", "cookies.sqlite-wal",
+                "logins.json", "key4.db", "cert9.db",
+                "sessionstore.jsonlz4"
+            };
+
+            string[] targetDirs = new string[]
+            {
+                "sessionstore-backups", "cache2", "storage\\default", "jumpListCache"
+            };
+
+            foreach (string p in profiles)
+            {
+                foreach (string f in targetFiles)
+                {
+                    try
+                    {
+                        string fp = Path.Combine(p, f);
+                        if (File.Exists(fp)) File.Delete(fp);
+                    }
+                    catch { }
+                }
+                foreach (string d in targetDirs)
+                {
+                    try
+                    {
+                        string dp = Path.Combine(p, d);
+                        if (Directory.Exists(dp)) Directory.Delete(dp, true);
+                    }
+                    catch { }
+                }
+            }
+        }
+    }
     public class MainForm : Form
     {
         private Bitmap _backdrop;
@@ -1562,6 +2074,17 @@ namespace WinCleaner
         private VirtualGlassButton _btnSelectFiles;
         private VirtualGlassButton _btnAddFolder;
         private VirtualGlassButton _btnShred;
+        private VirtualGlassButton _btnScanBrowsers;
+        private VirtualGlassButton _btnCleanAllBrowsers;
+        private VirtualGlassButton _btnOpenBHV;
+
+        public enum RightTabMode { Browsers, Shredder }
+        private RightTabMode _activeTab = RightTabMode.Browsers;
+        private RectangleF _tabBrowsersRect;
+        private RectangleF _tabShredderRect;
+        private bool _hoverTabBrowsers = false;
+        private bool _hoverTabShredder = false;
+        private List<BrowserItem> _activeBrowsers = new List<BrowserItem>();
 
         private RectangleF _leftCardRect;
         private RectangleF _rightCardRect;
@@ -1602,6 +2125,7 @@ namespace WinCleaner
             AutoScaleMode = AutoScaleMode.None;
 
             InitButtons();
+            try { _activeBrowsers = BrowserScanner.DetectInstalledBrowsers(); } catch { }
 
             Text = "WinCleaner — iOS 18 Glass";
             BackColor = Color.FromArgb(8, 10, 22);
@@ -1671,8 +2195,8 @@ namespace WinCleaner
             {
                 Id = "panic",
                 Title = "PANIC — Экстренная зачистка",
-                Subtitle = "Шредер списка + Буфер Win+V + Проводник + Shell Bags",
-                RightTag = "0 объ.",
+                Subtitle = "",
+                RightTag = "",
                 Icon = IconKind.Bolt,
                 Variant = BtnVariant.Red,
                 IsLarge = true,
@@ -1683,13 +2207,13 @@ namespace WinCleaner
             {
                 Id = "clip",
                 Title = "Очистить буфер обмена",
-                Subtitle = "История Win+V, текущее содержимое и папка HistoryData",
-                RightTag = "WinRT + User32",
+                Subtitle = "",
+                RightTag = "",
                 Icon = IconKind.Clipboard,
                 Variant = BtnVariant.Glass,
                 OnClick = delegate
                 {
-                    RunAsync(_btnClip, "Очистка Win+V и HistoryData…", Cleaner.CleanClipboard,
+                    RunAsync(_btnClip, "Очистка буфера…", Cleaner.CleanClipboard,
                         delegate { return "Буфер обмена очищен"; }, null);
                 }
             };
@@ -1698,8 +2222,8 @@ namespace WinCleaner
             {
                 Id = "explorer",
                 Title = "Очистить параметры Проводника",
-                Subtitle = "Недавние файлы, TypedPaths, WordWheelQuery, RunMRU",
-                RightTag = "Explorer MRU",
+                Subtitle = "",
+                RightTag = "",
                 Icon = IconKind.FolderSync,
                 Variant = BtnVariant.Glass,
                 OnClick = delegate
@@ -1713,8 +2237,8 @@ namespace WinCleaner
             {
                 Id = "bags",
                 Title = "Очистить реестр Shell Bags",
-                Subtitle = "Сброс Shell\\Bags, BagMRU и истории диалогов OpenSavePidlMRU",
-                RightTag = "14 веток",
+                Subtitle = "",
+                RightTag = "",
                 Icon = IconKind.Layers,
                 Variant = BtnVariant.Glass,
                 OnClick = delegate
@@ -1728,8 +2252,8 @@ namespace WinCleaner
             {
                 Id = "block",
                 Title = "Блокировать Hacker / Informer",
-                Subtitle = "Перехват запуска IFEO (systray.exe) + фоновый сторож процессов",
-                RightTag = "ВЫКЛ",
+                Subtitle = "",
+                RightTag = "",
                 Icon = IconKind.Shield,
                 Variant = BtnVariant.Glass,
                 OnClick = delegate
@@ -1738,7 +2262,7 @@ namespace WinCleaner
                         delegate
                         {
                             SyncToggleStates();
-                            return AppBlocker.IsBlocked() ? "Утилиты заблокированы (IFEO)" : "Блокировка снята";
+                            return AppBlocker.IsBlocked() ? "Утилиты заблокированы" : "Блокировка снята";
                         }, null);
                 }
             };
@@ -1747,17 +2271,17 @@ namespace WinCleaner
             {
                 Id = "netlock",
                 Title = "Изоляция: только MC / AnyDesk",
-                Subtitle = "Прямые фильтры ядра WFP (fwpuclnt.dll) и сброс TCP-таблицы",
-                RightTag = "ОТКРЫТО",
+                Subtitle = "",
+                RightTag = "",
                 Icon = IconKind.Wifi,
                 Variant = BtnVariant.Glass,
                 OnClick = delegate
                 {
-                    RunAsync(_btnNetLock, "Настройка фильтров ядра WFP…", NetLockdown.Toggle,
+                    RunAsync(_btnNetLock, "Настройка фильтров WFP…", NetLockdown.Toggle,
                         delegate
                         {
                             SyncToggleStates();
-                            return NetLockdown.IsLocked() ? "WFP-изоляция активна (только MC/AnyDesk)" : "Интернет разблокирован для всех";
+                            return NetLockdown.IsLocked() ? "WFP-изоляция активна" : "Интернет разблокирован";
                         }, null);
                 }
             };
@@ -1795,10 +2319,51 @@ namespace WinCleaner
                 OnClick = OnShredClicked
             };
 
+            _btnScanBrowsers = new VirtualGlassButton
+            {
+                Id = "scan_browsers",
+                Title = "Сканировать",
+                Subtitle = "",
+                RightTag = "",
+                Icon = IconKind.FolderSync,
+                Variant = BtnVariant.Blue,
+                OnClick = delegate
+                {
+                    _statusText = "Сканирование установленных браузеров…";
+                    _activeBrowsers = BrowserScanner.DetectInstalledBrowsers();
+                    ComputeLayout();
+                    _statusText = string.Format("Обнаружено браузеров: {0}", _activeBrowsers.Count);
+                    Invalidate();
+                }
+            };
+
+            _btnCleanAllBrowsers = new VirtualGlassButton
+            {
+                Id = "clean_all_browsers",
+                Title = "Очистить все",
+                Subtitle = "",
+                RightTag = "",
+                Icon = IconKind.Flame,
+                Variant = BtnVariant.Red,
+                OnClick = RunCleanAllBrowsersAsync
+            };
+
+            _btnOpenBHV = new VirtualGlassButton
+            {
+                Id = "open_bhv",
+                Title = "BrowsingHistoryView",
+                Subtitle = "",
+                RightTag = "",
+                Icon = IconKind.Shield,
+                Variant = BtnVariant.Glass,
+                OnClick = OnOpenBHVClicked
+            };
+
             _buttons.AddRange(new VirtualGlassButton[]
             {
                 _btnPanic, _btnClip, _btnExplorer, _btnBags, _btnBlock, _btnNetLock,
-                _btnSelectFiles, _btnAddFolder, _btnShred
+                _btnSelectFiles, _btnAddFolder, _btnShred,
+                _btnScanBrowsers, _btnCleanAllBrowsers, _btnOpenBHV
             });
         }
 
@@ -1806,15 +2371,15 @@ namespace WinCleaner
         {
             bool blocked = AppBlocker.IsBlocked();
             _btnBlock.Title = blocked ? "Разблокировать Hacker / Informer" : "Блокировать Hacker / Informer";
-            _btnBlock.RightTag = blocked ? "АКТИВНО" : "ВЫКЛ";
+            _btnBlock.RightTag = "";
             _btnBlock.IsActiveToggle = blocked;
 
             bool netLocked = NetLockdown.IsLocked();
             _btnNetLock.Title = netLocked ? "Разблокировать интернет для всех" : "Изоляция: только MC / AnyDesk";
-            _btnNetLock.RightTag = netLocked ? "WFP LOCK" : "ОТКРЫТО";
+            _btnNetLock.RightTag = "";
             _btnNetLock.IsActiveToggle = netLocked;
 
-            _btnPanic.RightTag = _files.Count + " объ.";
+            _btnPanic.RightTag = "";
             Invalidate();
         }
 
@@ -1872,22 +2437,60 @@ namespace WinCleaner
             float btnGap = 12f;
             float btnW = (rw - btnGap * 2f) / 3f;
 
-            _btnSelectFiles.Bounds = new RectangleF(rx, btnY, btnW, bottomBtnH);
-            _btnAddFolder.Bounds = new RectangleF(rx + btnW + btnGap, btnY, btnW, bottomBtnH);
-            _btnShred.Bounds = new RectangleF(rx + (btnW + btnGap) * 2f, btnY, btnW, bottomBtnH);
+            float tabW = 135f;
+            float tabH = 26f;
+            float tabY = _rightCardRect.Y + 18f;
+            float tabX = _rightCardRect.Right - (tabW * 2f + 24f);
+            _tabBrowsersRect = new RectangleF(tabX, tabY, tabW, tabH);
+            _tabShredderRect = new RectangleF(tabX + tabW + 6f, tabY, tabW, tabH);
 
-            // File rows layout inside drop zone
-            float rowX = _dropZoneRect.X + 14f;
-            float rowW = _dropZoneRect.Width - 28f;
-            float rowY = _dropZoneRect.Y + 14f - _scrollOffset;
-            float rowH = 54f;
-            float rowGap = 8f;
-
-            for (int i = 0; i < _files.Count; i++)
+            if (_activeTab == RightTabMode.Browsers)
             {
-                _files[i].RowBounds = new RectangleF(rowX, rowY, rowW, rowH);
-                _files[i].DeleteBtnBounds = new RectangleF(rowX + rowW - 38f, rowY + (rowH - 28f) * 0.5f, 28f, 28f);
-                rowY += rowH + rowGap;
+                _btnScanBrowsers.Bounds = new RectangleF(rx, btnY, btnW, bottomBtnH);
+                _btnCleanAllBrowsers.Bounds = new RectangleF(rx + btnW + btnGap, btnY, btnW, bottomBtnH);
+                _btnOpenBHV.Bounds = new RectangleF(rx + (btnW + btnGap) * 2f, btnY, btnW, bottomBtnH);
+
+                _btnSelectFiles.Bounds = RectangleF.Empty;
+                _btnAddFolder.Bounds = RectangleF.Empty;
+                _btnShred.Bounds = RectangleF.Empty;
+
+                float browX = _dropZoneRect.X + 14f;
+                float browW = _dropZoneRect.Width - 28f;
+                float browY = _dropZoneRect.Y + 14f - _scrollOffset;
+                float browH = 62f;
+                float browGap = 10f;
+
+                for (int i = 0; i < _activeBrowsers.Count; i++)
+                {
+                    BrowserItem b = _activeBrowsers[i];
+                    b.RowBounds = new RectangleF(browX, browY, browW, browH);
+                    b.ActionBtnBounds = new RectangleF(browX + browW - 110f, browY + (browH - 34f) * 0.5f, 98f, 34f);
+                    b.IndicatorBounds = new RectangleF(b.ActionBtnBounds.Left - 132f, browY + (browH - 26f) * 0.5f, 122f, 26f);
+                    browY += browH + browGap;
+                }
+            }
+            else
+            {
+                _btnSelectFiles.Bounds = new RectangleF(rx, btnY, btnW, bottomBtnH);
+                _btnAddFolder.Bounds = new RectangleF(rx + btnW + btnGap, btnY, btnW, bottomBtnH);
+                _btnShred.Bounds = new RectangleF(rx + (btnW + btnGap) * 2f, btnY, btnW, bottomBtnH);
+
+                _btnScanBrowsers.Bounds = RectangleF.Empty;
+                _btnCleanAllBrowsers.Bounds = RectangleF.Empty;
+                _btnOpenBHV.Bounds = RectangleF.Empty;
+
+                float rowX = _dropZoneRect.X + 14f;
+                float rowW = _dropZoneRect.Width - 28f;
+                float rowY = _dropZoneRect.Y + 14f - _scrollOffset;
+                float rowH = 54f;
+                float rowGap = 8f;
+
+                for (int i = 0; i < _files.Count; i++)
+                {
+                    _files[i].RowBounds = new RectangleF(rowX, rowY, rowW, rowH);
+                    _files[i].DeleteBtnBounds = new RectangleF(rowX + rowW - 38f, rowY + (rowH - 28f) * 0.5f, 28f, 28f);
+                    rowY += rowH + rowGap;
+                }
             }
         }
 
@@ -2106,13 +2709,11 @@ namespace WinCleaner
                 42
             );
 
-            // Header & Subtitle
+            // Header
             float hx = _leftCardRect.X + 22f;
-            float hy = _leftCardRect.Y + 20f;
+            float hy = _leftCardRect.Y + 22f;
             TextRenderer.DrawText(g, "Системная очистка и защита", _fontCardTitle,
                 new Point((int)hx, (int)hy), Color.White, TextFormatFlags.NoPadding);
-            TextRenderer.DrawText(g, "Мгновенное удаление следов активности и блокировка анализаторов", _fontCardSub,
-                new Point((int)hx, (int)(hy + 27f)), Color.FromArgb(155, 245, 245, 247), TextFormatFlags.NoPadding);
 
             // Dividers
             float div1Y = _btnPanic.Bounds.Bottom + 11f;
@@ -2133,14 +2734,10 @@ namespace WinCleaner
             float footY = _leftCardRect.Bottom - 36f;
             DrawHairlineDivider(g, hx, footY - 8f, _leftCardRect.Width - 44f);
 
-            Rectangle statusRect = new Rectangle((int)hx, (int)footY, (int)(_leftCardRect.Width - 105f), 20);
+            Rectangle statusRect = new Rectangle((int)hx, (int)footY, (int)(_leftCardRect.Width - 44f), 20);
             Color stColor = _statusWarn ? Color.FromArgb(255, 110, 100) : Color.FromArgb(165, 245, 245, 247);
             TextRenderer.DrawText(g, _statusText, _fontFooter, statusRect, stColor,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-
-            Rectangle uiTagRect = new Rectangle((int)(_leftCardRect.Right - 82f), (int)footY, 60, 20);
-            TextRenderer.DrawText(g, "iOS 18 UI", _fontMonoTag, uiTagRect, Color.FromArgb(115, 245, 245, 247),
-                TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
         }
 
         private void DrawRightCard(Graphics g)
@@ -2158,112 +2755,267 @@ namespace WinCleaner
             );
 
             float hx = _rightCardRect.X + 22f;
-            float hy = _rightCardRect.Y + 20f;
-            TextRenderer.DrawText(g, "Криптографический шредер (3 прохода DoD)", _fontCardTitle,
-                new Point((int)hx, (int)hy), Color.White, TextFormatFlags.NoPadding);
-            TextRenderer.DrawText(g, "Перезапись 0x00 · 0xFF · Crypto RNG · Сброс меток 2000-01-01 · Тройное переименование", _fontCardSub,
-                new Point((int)hx, (int)(hy + 27f)), Color.FromArgb(155, 245, 245, 247), TextFormatFlags.NoPadding);
+            float hy = _rightCardRect.Y + 22f;
 
-            // Top-right Total Count & Size + "Очистить список"
-            long totalBytes = 0;
-            for (int i = 0; i < _files.Count; i++) totalBytes += _files[i].SizeBytes;
-            string summary = string.Format("{0} объ. · {1}", _files.Count, FormatSize(totalBytes));
+            // Render Segmented Tab Pills
+            DrawTabPill(g, _tabBrowsersRect, "Браузеры (" + _activeBrowsers.Count + ")", _activeTab == RightTabMode.Browsers, _hoverTabBrowsers, IconKind.Globe);
+            DrawTabPill(g, _tabShredderRect, "Шредер (" + _files.Count + ")", _activeTab == RightTabMode.Shredder, _hoverTabShredder, IconKind.Flame);
 
-            Rectangle sumRect = new Rectangle((int)(_rightCardRect.Right - 210f), (int)hy, 188, 20);
-            TextRenderer.DrawText(g, summary, _fontMonoTag, sumRect, Color.FromArgb(200, 245, 245, 247),
-                TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
-
-            if (_files.Count > 0)
+            if (_activeTab == RightTabMode.Browsers)
             {
-                Color linkCol = _hoverClearLink ? Color.FromArgb(100, 210, 255) : Color.FromArgb(10, 132, 255);
-                TextRenderer.DrawText(g, "Очистить список", _fontFooter,
-                    Rectangle.Round(_clearListLinkRect), linkCol,
-                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
-            }
+                TextRenderer.DrawText(g, "Аудит и зачистка браузеров", _fontCardTitle,
+                    new Point((int)hx, (int)hy), Color.White, TextFormatFlags.NoPadding);
 
-            // Inner Drop Zone Container
-            Color dropTop = Color.FromArgb(16, 255, 255, 255);
-            Color dropBot = Color.FromArgb(12, 255, 255, 255);
-            Color dropBorder = Color.FromArgb(36, 255, 255, 255);
-            float dropBorderW = 1f;
-
-            if (_dropSuccessFlash > 0.01f)
-            {
-                dropTop = Color.FromArgb((int)(20 + _dropSuccessFlash * 55), 48, 209, 88);
-                dropBot = Color.FromArgb((int)(12 + _dropSuccessFlash * 30), 48, 209, 88);
-                dropBorder = Color.FromArgb((int)(90 + _dropSuccessFlash * 165), 48, 209, 88);
-                dropBorderW = 1.8f;
-            }
-            else if (_isDragOver)
-            {
-                int pulse = 135 + (int)(Math.Sin(_dragPulsePhase) * 90);
-                dropTop = Color.FromArgb(35, 10, 132, 255);
-                dropBot = Color.FromArgb(20, 10, 132, 255);
-                dropBorder = Color.FromArgb(pulse, 10, 132, 255);
-                dropBorderW = 1.8f;
-            }
-
-            DrawGlassSurface(g, _dropZoneRect, 18f, dropTop, dropBot, dropBorder, dropBorderW, 25);
-
-            // Clip file items inside the drop zone without leaking Region handles
-            GraphicsState dzState = g.Save();
-            Rectangle dzClipRect = new Rectangle(
-                (int)_dropZoneRect.X + 2,
-                (int)_dropZoneRect.Y + 2,
-                Math.Max(1, (int)_dropZoneRect.Width - 4),
-                Math.Max(1, (int)_dropZoneRect.Height - 40));
-            g.SetClip(dzClipRect);
-
-            if (_files.Count == 0)
-            {
-                // Empty state hint
-                float cx = _dropZoneRect.X + _dropZoneRect.Width * 0.5f;
-                float cy = _dropZoneRect.Y + (_dropZoneRect.Height - 36f) * 0.5f - 12f;
-
-                RectangleF iconBadge = new RectangleF(cx - 24f, cy - 36f, 48f, 48f);
-                DrawGlassSurface(g, iconBadge, 14f,
-                    Color.FromArgb(26, 255, 255, 255),
+                DrawGlassSurface(g, _dropZoneRect, 18f,
                     Color.FromArgb(16, 255, 255, 255),
-                    Color.FromArgb(45, 255, 255, 255), 1f, 30);
-                DrawVectorIcon(g, IconKind.CloudAdd, new RectangleF(cx - 10f, cy - 22f, 20f, 20f), Color.FromArgb(10, 132, 255));
+                    Color.FromArgb(12, 255, 255, 255),
+                    Color.FromArgb(36, 255, 255, 255), 1f, 25);
 
-                Rectangle hint1 = new Rectangle((int)_dropZoneRect.X + 20, (int)(cy + 22f), (int)_dropZoneRect.Width - 40, 22);
-                TextRenderer.DrawText(g, "Перетащите файлы или папки сюда", _fontBtnTitle, hint1,
-                    Color.FromArgb(230, 245, 245, 247), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                GraphicsState dzState = g.Save();
+                Rectangle dzClipRect = new Rectangle(
+                    (int)_dropZoneRect.X + 2,
+                    (int)_dropZoneRect.Y + 2,
+                    Math.Max(1, (int)_dropZoneRect.Width - 4),
+                    Math.Max(1, (int)_dropZoneRect.Height - 4));
+                g.SetClip(dzClipRect);
 
-                Rectangle hint2 = new Rectangle((int)_dropZoneRect.X + 20, (int)(cy + 44f), (int)_dropZoneRect.Width - 40, 20);
-                TextRenderer.DrawText(g, "Системные каталоги Windows и Program Files автоматически защищены от удаления", _fontBtnSub, hint2,
-                    Color.FromArgb(135, 245, 245, 247), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                if (_activeBrowsers.Count == 0)
+                {
+                    float cx = _dropZoneRect.X + _dropZoneRect.Width * 0.5f;
+                    float cy = _dropZoneRect.Y + _dropZoneRect.Height * 0.5f - 8f;
+
+                    RectangleF iconBadge = new RectangleF(cx - 24f, cy - 36f, 48f, 48f);
+                    DrawGlassSurface(g, iconBadge, 14f,
+                        Color.FromArgb(26, 255, 255, 255),
+                        Color.FromArgb(16, 255, 255, 255),
+                        Color.FromArgb(45, 255, 255, 255), 1f, 30);
+                    DrawVectorIcon(g, IconKind.Globe, new RectangleF(cx - 10f, cy - 22f, 20f, 20f), Color.FromArgb(10, 132, 255));
+
+                    Rectangle hint1 = new Rectangle((int)_dropZoneRect.X + 20, (int)(cy + 22f), (int)_dropZoneRect.Width - 40, 24);
+                    TextRenderer.DrawText(g, "Установленные браузеры не обнаружены", _fontBtnTitle, hint1,
+                        Color.FromArgb(230, 245, 245, 247), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
+                else
+                {
+                    for (int i = 0; i < _activeBrowsers.Count; i++)
+                    {
+                        DrawBrowserRow(g, _activeBrowsers[i]);
+                    }
+                }
+
+                g.Restore(dzState);
+
+                DrawVirtualButton(g, _btnScanBrowsers);
+                DrawVirtualButton(g, _btnCleanAllBrowsers);
+                DrawVirtualButton(g, _btnOpenBHV);
             }
             else
             {
-                for (int i = 0; i < _files.Count; i++)
+                TextRenderer.DrawText(g, "Криптографический шредер", _fontCardTitle,
+                    new Point((int)hx, (int)hy), Color.White, TextFormatFlags.NoPadding);
+
+                if (_files.Count > 0)
                 {
-                    DrawFileRow(g, _files[i]);
+                    Color linkCol = _hoverClearLink ? Color.FromArgb(255, 120, 110) : Color.FromArgb(100, 210, 255);
+                    TextRenderer.DrawText(g, "Очистить список", _fontFooter,
+                        Rectangle.Round(_clearListLinkRect), linkCol,
+                        TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
                 }
+
+                Color dropTop = Color.FromArgb(16, 255, 255, 255);
+                Color dropBot = Color.FromArgb(12, 255, 255, 255);
+                Color dropBorder = Color.FromArgb(36, 255, 255, 255);
+                float dropBorderW = 1f;
+
+                if (_dropSuccessFlash > 0.01f)
+                {
+                    dropTop = Color.FromArgb((int)(20 + _dropSuccessFlash * 55), 48, 209, 88);
+                    dropBot = Color.FromArgb((int)(12 + _dropSuccessFlash * 30), 48, 209, 88);
+                    dropBorder = Color.FromArgb((int)(90 + _dropSuccessFlash * 165), 48, 209, 88);
+                    dropBorderW = 1.8f;
+                }
+                else if (_isDragOver)
+                {
+                    int pulse = 135 + (int)(Math.Sin(_dragPulsePhase) * 90);
+                    dropTop = Color.FromArgb(35, 10, 132, 255);
+                    dropBot = Color.FromArgb(20, 10, 132, 255);
+                    dropBorder = Color.FromArgb(pulse, 10, 132, 255);
+                    dropBorderW = 1.8f;
+                }
+
+                DrawGlassSurface(g, _dropZoneRect, 18f, dropTop, dropBot, dropBorder, dropBorderW, 25);
+
+                GraphicsState dzState = g.Save();
+                Rectangle dzClipRect = new Rectangle(
+                    (int)_dropZoneRect.X + 2,
+                    (int)_dropZoneRect.Y + 2,
+                    Math.Max(1, (int)_dropZoneRect.Width - 4),
+                    Math.Max(1, (int)_dropZoneRect.Height - 4));
+                g.SetClip(dzClipRect);
+
+                if (_files.Count == 0)
+                {
+                    float cx = _dropZoneRect.X + _dropZoneRect.Width * 0.5f;
+                    float cy = _dropZoneRect.Y + _dropZoneRect.Height * 0.5f - 8f;
+
+                    RectangleF iconBadge = new RectangleF(cx - 24f, cy - 36f, 48f, 48f);
+                    DrawGlassSurface(g, iconBadge, 14f,
+                        Color.FromArgb(26, 255, 255, 255),
+                        Color.FromArgb(16, 255, 255, 255),
+                        Color.FromArgb(45, 255, 255, 255), 1f, 30);
+                    DrawVectorIcon(g, IconKind.CloudAdd, new RectangleF(cx - 10f, cy - 22f, 20f, 20f), Color.FromArgb(10, 132, 255));
+
+                    Rectangle hint1 = new Rectangle((int)_dropZoneRect.X + 20, (int)(cy + 22f), (int)_dropZoneRect.Width - 40, 24);
+                    TextRenderer.DrawText(g, "Перетащите файлы или папки сюда", _fontBtnTitle, hint1,
+                        Color.FromArgb(230, 245, 245, 247), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
+                else
+                {
+                    for (int i = 0; i < _files.Count; i++)
+                    {
+                        DrawFileRow(g, _files[i]);
+                    }
+                }
+
+                g.Restore(dzState);
+
+                DrawVirtualButton(g, _btnSelectFiles);
+                DrawVirtualButton(g, _btnAddFolder);
+                DrawVirtualButton(g, _btnShred);
             }
-
-            g.Restore(dzState);
-
-            // Bottom Footer inside Drop Zone
-            float dzFootY = _dropZoneRect.Bottom - 34f;
-            DrawHairlineDivider(g, _dropZoneRect.X + 14f, dzFootY - 4f, _dropZoneRect.Width - 28f);
-
-            DrawVectorIcon(g, IconKind.CheckCircle, new RectangleF(_dropZoneRect.X + 16f, dzFootY + 5f, 14f, 14f), Color.FromArgb(48, 209, 88));
-            Rectangle dzFootLeft = new Rectangle((int)(_dropZoneRect.X + 36f), (int)dzFootY, (int)(_dropZoneRect.Width - 180f), 24);
-            TextRenderer.DrawText(g, "Очистка ComDlg32 MRU и ярлыков Recent (.lnk) после прохода", _fontBtnSub, dzFootLeft,
-                Color.FromArgb(150, 245, 245, 247), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
-
-            Rectangle dzFootRight = new Rectangle((int)(_dropZoneRect.Right - 150f), (int)dzFootY, 136, 24);
-            TextRenderer.DrawText(g, "WriteThrough · 64 КБ", _fontFileMeta, dzFootRight,
-                Color.FromArgb(135, 245, 245, 247), TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
-
-            // Bottom 3 Action Buttons
-            DrawVirtualButton(g, _btnSelectFiles);
-            DrawVirtualButton(g, _btnAddFolder);
-            DrawVirtualButton(g, _btnShred);
         }
 
+        private void DrawTabPill(Graphics g, RectangleF r, string text, bool active, bool hover, IconKind icon)
+        {
+            Color topFill = active
+                ? Color.FromArgb(55, 10, 132, 255)
+                : (hover ? Color.FromArgb(32, 255, 255, 255) : Color.FromArgb(18, 255, 255, 255));
+            Color botFill = active
+                ? Color.FromArgb(30, 10, 132, 255)
+                : (hover ? Color.FromArgb(20, 255, 255, 255) : Color.FromArgb(12, 255, 255, 255));
+            Color borderCol = active
+                ? Color.FromArgb(130, 10, 132, 255)
+                : (hover ? Color.FromArgb(55, 255, 255, 255) : Color.FromArgb(34, 255, 255, 255));
+
+            DrawGlassSurface(g, r, 9f, topFill, botFill, borderCol, 1f, active ? 25 : 0);
+
+            Color iconCol = active ? Color.FromArgb(100, 210, 255) : Color.FromArgb(160, 245, 245, 247);
+            DrawVectorIcon(g, icon, new RectangleF(r.X + 8f, r.Y + (r.Height - 14f) * 0.5f, 14f, 14f), iconCol);
+
+            Color textCol = active ? Color.White : Color.FromArgb(185, 245, 245, 247);
+            Rectangle textRect = new Rectangle((int)(r.X + 26f), (int)r.Y, (int)(r.Width - 30f), (int)r.Height);
+            TextRenderer.DrawText(g, text, _fontBtnSub, textRect, textCol,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+        }
+
+        private void DrawBrowserRow(Graphics g, BrowserItem item)
+        {
+            RectangleF r = item.RowBounds;
+            if (r.Bottom < _dropZoneRect.Y || r.Top > _dropZoneRect.Bottom - 36f) return;
+
+            int bgAlpha = 20 + (int)(item.HoverMix * 14f);
+            DrawGlassSurface(
+                g,
+                r,
+                14f,
+                Color.FromArgb(bgAlpha + 6, 255, 255, 255),
+                Color.FromArgb(bgAlpha, 255, 255, 255),
+                Color.FromArgb(34 + (int)(item.HoverMix * 20f), 255, 255, 255),
+                1f,
+                22
+            );
+
+            // Left Icon Badge
+            RectangleF badge = new RectangleF(r.X + 12f, r.Y + (r.Height - 34f) * 0.5f, 34f, 34f);
+            Color badgeTint = item.IsClean ? Color.FromArgb(48, 209, 88) : Color.FromArgb(100, 210, 255);
+            DrawGlassSurface(g, badge, 10f,
+                Color.FromArgb(24, 255, 255, 255),
+                Color.FromArgb(16, 255, 255, 255),
+                Color.FromArgb(38, 255, 255, 255), 1f, 0);
+            DrawVectorIcon(g, IconKind.Globe, new RectangleF(badge.X + 9f, badge.Y + 9f, 16f, 16f), badgeTint);
+
+            // Browser Name (vertically centered)
+            int textX = (int)(badge.Right + 12f);
+            int textW = (int)(item.IndicatorBounds.Left - textX - 10f);
+
+            Rectangle titleRect = new Rectangle(textX, (int)r.Y, textW, (int)r.Height);
+            TextRenderer.DrawText(g, item.Name, _fontBtnTitle, titleRect, Color.White,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+
+            // Indicator Badge (Green or Red glowing LED pill)
+            RectangleF indR = item.IndicatorBounds;
+            Color indTop, indBot, indBorder, ledColor;
+            string indText;
+
+            if (item.IsClean)
+            {
+                indTop = Color.FromArgb(35, 48, 209, 88);
+                indBot = Color.FromArgb(18, 48, 209, 88);
+                indBorder = Color.FromArgb(95, 48, 209, 88);
+                ledColor = Color.FromArgb(48, 209, 88);
+                indText = "ЧИСТ";
+            }
+            else
+            {
+                indTop = Color.FromArgb(40, 255, 69, 58);
+                indBot = Color.FromArgb(22, 255, 69, 58);
+                indBorder = Color.FromArgb(110, 255, 69, 58);
+                ledColor = Color.FromArgb(255, 69, 58);
+                indText = "ЕСТЬ ИСТОРИЯ";
+            }
+
+            DrawGlassSurface(g, indR, 8f, indTop, indBot, indBorder, 1f, 0);
+
+            using (SolidBrush glowBr = new SolidBrush(Color.FromArgb(60, ledColor.R, ledColor.G, ledColor.B)))
+            {
+                g.FillEllipse(glowBr, indR.X + 6f, indR.Y + 8f, 10f, 10f);
+            }
+            using (SolidBrush dotBr = new SolidBrush(ledColor))
+            {
+                g.FillEllipse(dotBr, indR.X + 8f, indR.Y + 10f, 6f, 6f);
+            }
+
+            Rectangle indTextRect = new Rectangle((int)(indR.X + 20f), (int)indR.Y, (int)(indR.Width - 24f), (int)indR.Height);
+            TextRenderer.DrawText(g, indText, _fontMonoTag, indTextRect, ledColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+
+            // Clean Action Button
+            RectangleF btnR = item.ActionBtnBounds;
+            Color btnTop, btnBot, btnBorder, btnTextCol;
+            string btnLabel;
+
+            if (item.IsCleaning)
+            {
+                btnTop = Color.FromArgb(45, 10, 132, 255);
+                btnBot = Color.FromArgb(25, 10, 132, 255);
+                btnBorder = Color.FromArgb(110, 10, 132, 255);
+                btnTextCol = Color.White;
+                btnLabel = "Зачистка…";
+            }
+            else if (item.IsClean)
+            {
+                int hAlpha = (int)(item.BtnHoverMix * 25f);
+                btnTop = Color.FromArgb(25 + hAlpha, 48, 209, 88);
+                btnBot = Color.FromArgb(15 + hAlpha, 48, 209, 88);
+                btnBorder = Color.FromArgb(60 + hAlpha, 48, 209, 88);
+                btnTextCol = Color.FromArgb(48, 209, 88);
+                btnLabel = "Очистить";
+            }
+            else
+            {
+                int hAlpha = (int)(item.BtnHoverMix * 40f);
+                btnTop = Color.FromArgb(60 + hAlpha, 255, 69, 58);
+                btnBot = Color.FromArgb(35 + hAlpha, 255, 69, 58);
+                btnBorder = Color.FromArgb(120 + hAlpha, 255, 69, 58);
+                btnTextCol = Color.White;
+                btnLabel = "Очистить";
+            }
+
+            DrawGlassSurface(g, btnR, 10f, btnTop, btnBot, btnBorder, 1f, 15);
+            Rectangle btnTextRect = new Rectangle((int)btnR.X, (int)btnR.Y, (int)btnR.Width, (int)btnR.Height);
+            TextRenderer.DrawText(g, btnLabel, _fontBtnTitle, btnTextRect, btnTextCol,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
         private void DrawFileRow(Graphics g, ShredEntry item)
         {
             RectangleF r = item.RowBounds;
@@ -2297,7 +3049,7 @@ namespace WinCleaner
             TextRenderer.DrawText(g, item.Path, _fontFilePath, pathRect, Color.FromArgb(240, 245, 245, 247),
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.PathEllipsis | TextFormatFlags.NoPrefix);
 
-            string meta = string.Format("{0}  ·  3 прохода (0x00, 0xFF, RNG)", FormatSize(item.SizeBytes));
+            string meta = FormatSize(item.SizeBytes);
             Rectangle metaRect = new Rectangle(textX, (int)(r.Y + 28f), textW, 18);
             TextRenderer.DrawText(g, meta, _fontFileMeta, metaRect, Color.FromArgb(135, 245, 245, 247),
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
@@ -2447,9 +3199,10 @@ namespace WinCleaner
             int textLeft = (int)(rect.X + 46f);
             int textWidth = Math.Max(40, (int)(rect.Width - 46f - rightReserve));
 
+            Font tf = b.IsLarge ? _fontPanicTitle : _fontBtnTitle;
+
             if (hasSubtitle)
             {
-                Font tf = b.IsLarge ? _fontPanicTitle : _fontBtnTitle;
                 Rectangle titleRect = new Rectangle(textLeft, (int)(rect.Y + (b.IsLarge ? 11f : 8f)), textWidth, 22);
                 TextRenderer.DrawText(g, mainTitle, tf, titleRect, Color.White,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
@@ -2460,8 +3213,8 @@ namespace WinCleaner
             }
             else
             {
-                Rectangle titleRect = new Rectangle(textLeft - 4, (int)rect.Y, (int)(rect.Width - 48f), (int)rect.Height);
-                TextRenderer.DrawText(g, mainTitle, _fontBtnTitle, titleRect, Color.White,
+                Rectangle titleRect = new Rectangle(textLeft, (int)rect.Y, textWidth, (int)rect.Height);
+                TextRenderer.DrawText(g, mainTitle, tf, titleRect, Color.White,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
             }
 
@@ -2614,6 +3367,12 @@ namespace WinCleaner
                             new PointF(cx + 3.0f, cy - 1.8f)
                         });
                         break;
+
+                    case IconKind.Globe:
+                        g.DrawEllipse(p, cx - 6f, cy - 6f, 12f, 12f);
+                        g.DrawEllipse(p, cx - 3.2f, cy - 6f, 6.4f, 12f);
+                        g.DrawLine(p, cx - 6f, cy, cx + 6f, cy);
+                        break;
                 }
             }
         }
@@ -2636,18 +3395,43 @@ namespace WinCleaner
                 if (hit) anyHover = true;
             }
 
-            bool clrHit = !_busy && _files.Count > 0 && _clearListLinkRect.Contains(pt);
-            if (clrHit != _hoverClearLink) { _hoverClearLink = clrHit; Invalidate(); }
-            if (clrHit) anyHover = true;
-
-            for (int i = 0; i < _files.Count; i++)
+            bool tabBHit = !_busy && _tabBrowsersRect.Contains(pt);
+            bool tabSHit = !_busy && _tabShredderRect.Contains(pt);
+            if (tabBHit != _hoverTabBrowsers || tabSHit != _hoverTabShredder)
             {
-                ShredEntry f = _files[i];
-                bool rHit = f.RowBounds.Contains(pt) && _dropZoneRect.Contains(pt);
-                bool dHit = rHit && f.DeleteBtnBounds.Contains(pt);
-                f.HoverMix = rHit ? 1f : 0f;
-                f.DeleteHoverMix = dHit ? 1f : 0f;
-                if (dHit) anyHover = true;
+                _hoverTabBrowsers = tabBHit;
+                _hoverTabShredder = tabSHit;
+                Invalidate();
+            }
+            if (tabBHit || tabSHit) anyHover = true;
+
+            if (_activeTab == RightTabMode.Browsers)
+            {
+                for (int i = 0; i < _activeBrowsers.Count; i++)
+                {
+                    BrowserItem b = _activeBrowsers[i];
+                    bool rHit = b.RowBounds.Contains(pt) && _dropZoneRect.Contains(pt);
+                    bool bHit = rHit && b.ActionBtnBounds.Contains(pt);
+                    b.HoverMix = rHit ? 1f : 0f;
+                    b.BtnHoverMix = bHit ? 1f : 0f;
+                    if (bHit) anyHover = true;
+                }
+            }
+            else
+            {
+                bool clrHit = !_busy && _files.Count > 0 && _clearListLinkRect.Contains(pt);
+                if (clrHit != _hoverClearLink) { _hoverClearLink = clrHit; Invalidate(); }
+                if (clrHit) anyHover = true;
+
+                for (int i = 0; i < _files.Count; i++)
+                {
+                    ShredEntry f = _files[i];
+                    bool rHit = f.RowBounds.Contains(pt) && _dropZoneRect.Contains(pt);
+                    bool dHit = rHit && f.DeleteBtnBounds.Contains(pt);
+                    f.HoverMix = rHit ? 1f : 0f;
+                    f.DeleteHoverMix = dHit ? 1f : 0f;
+                    if (dHit) anyHover = true;
+                }
             }
 
             Cursor = anyHover ? Cursors.Hand : Cursors.Default;
@@ -2686,25 +3470,57 @@ namespace WinCleaner
                 }
             }
 
-            if (_files.Count > 0 && _clearListLinkRect.Contains(e.Location))
+            if (_tabBrowsersRect.Contains(e.Location))
             {
-                _files.Clear();
+                _activeTab = RightTabMode.Browsers;
                 _scrollOffset = 0;
-                SyncToggleStates();
-                _statusText = "Список шредера очищен";
+                ComputeLayout();
+                Invalidate();
+                return;
+            }
+            if (_tabShredderRect.Contains(e.Location))
+            {
+                _activeTab = RightTabMode.Shredder;
+                _scrollOffset = 0;
+                ComputeLayout();
                 Invalidate();
                 return;
             }
 
-            for (int i = _files.Count - 1; i >= 0; i--)
+            if (_activeTab == RightTabMode.Browsers)
             {
-                if (_files[i].DeleteBtnBounds.Contains(e.Location) && _dropZoneRect.Contains(e.Location))
+                for (int i = 0; i < _activeBrowsers.Count; i++)
                 {
-                    _files.RemoveAt(i);
-                    ComputeLayout();
+                    BrowserItem b = _activeBrowsers[i];
+                    if (b.ActionBtnBounds.Contains(e.Location) && _dropZoneRect.Contains(e.Location))
+                    {
+                        RunCleanBrowserAsync(b);
+                        return;
+                    }
+                }
+            }
+            else
+            {
+                if (_files.Count > 0 && _clearListLinkRect.Contains(e.Location))
+                {
+                    _files.Clear();
+                    _scrollOffset = 0;
                     SyncToggleStates();
+                    _statusText = "Список шредера очищен";
                     Invalidate();
-                    break;
+                    return;
+                }
+
+                for (int i = _files.Count - 1; i >= 0; i--)
+                {
+                    if (_files[i].DeleteBtnBounds.Contains(e.Location) && _dropZoneRect.Contains(e.Location))
+                    {
+                        _files.RemoveAt(i);
+                        ComputeLayout();
+                        SyncToggleStates();
+                        Invalidate();
+                        break;
+                    }
                 }
             }
         }
@@ -2712,9 +3528,11 @@ namespace WinCleaner
         protected override void OnMouseWheel(MouseEventArgs e)
         {
             base.OnMouseWheel(e);
-            if (_files.Count > 3 && _dropZoneRect.Contains(e.Location))
+            int count = _activeTab == RightTabMode.Browsers ? _activeBrowsers.Count : _files.Count;
+            int h = _activeTab == RightTabMode.Browsers ? 72 : 62;
+            if (count > 3 && _dropZoneRect.Contains(e.Location))
             {
-                int maxScroll = Math.Max(0, _files.Count * 62 - (int)(_dropZoneRect.Height - 54f));
+                int maxScroll = Math.Max(0, count * h - (int)(_dropZoneRect.Height - 54f));
                 _scrollOffset = Math.Max(0, Math.Min(maxScroll, _scrollOffset - (e.Delta > 0 ? 36 : -36)));
                 ComputeLayout();
                 Invalidate();
@@ -2819,6 +3637,100 @@ namespace WinCleaner
             }
         }
 
+        private void RunCleanBrowserAsync(BrowserItem b)
+        {
+            if (_busy) return;
+            _busy = true;
+            b.IsCleaning = true;
+            _statusText = string.Format("Зачистка {0}: закрытие процессов и удаление истории…", b.Name);
+            Invalidate();
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    BrowserScanner.CleanBrowser(b);
+                    BeginInvoke(new Action(delegate
+                    {
+                        b.IsCleaning = false;
+                        _busy = false;
+                        _statusText = string.Format("{0} зачищен · BrowsingHistoryView: 0 записей", b.Name);
+                        _statusWarn = false;
+                        Invalidate();
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        b.IsCleaning = false;
+                        _busy = false;
+                        _statusText = "Ошибка зачистки: " + ex.Message;
+                        _statusWarn = true;
+                        Invalidate();
+                    }));
+                }
+            });
+        }
+
+        private void RunCleanAllBrowsersAsync()
+        {
+            if (_busy) return;
+            _busy = true;
+            _statusText = "Глубокая зачистка всех обнаруженных браузеров…";
+            Invalidate();
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    foreach (var b in _activeBrowsers)
+                    {
+                        b.IsCleaning = true;
+                        BeginInvoke(new Action(delegate { Invalidate(); }));
+                        BrowserScanner.CleanBrowser(b);
+                        b.IsCleaning = false;
+                    }
+                    BrowserScanner.CleanWindowsWebCache();
+
+                    BeginInvoke(new Action(delegate
+                    {
+                        _busy = false;
+                        _statusText = "Все браузеры зачищены · BrowsingHistoryView чист";
+                        _statusWarn = false;
+                        Invalidate();
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        _busy = false;
+                        _statusText = "Ошибка зачистки: " + ex.Message;
+                        _statusWarn = true;
+                        Invalidate();
+                    }));
+                }
+            });
+        }
+
+        private void OnOpenBHVClicked()
+        {
+            string bhvPath = @"c:\Users\romal\Downloads\browsinghistoryview\BrowsingHistoryView.exe";
+            if (!File.Exists(bhvPath))
+            {
+                bhvPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "BrowsingHistoryView.exe");
+            }
+            if (File.Exists(bhvPath))
+            {
+                try { Process.Start(bhvPath); } catch { }
+            }
+            else
+            {
+                MessageBox.Show(this, "Файл BrowsingHistoryView.exe не найден по пути:\n" + bhvPath, "WinCleaner", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
         private void OnAddFolderClicked()
         {
             using (FolderBrowserDialog dlg = new FolderBrowserDialog())
@@ -2846,6 +3758,10 @@ namespace WinCleaner
                         res.Merge(sr);
                     }
                     res.Merge(Cleaner.CleanAll());
+                    foreach (var b in _activeBrowsers)
+                    {
+                        try { BrowserScanner.CleanBrowser(b); } catch { }
+                    }
                     return res;
                 },
                 delegate(CleanResult r) { return "PANIC выполнен · уничтожено файлов: " + shredded; },
