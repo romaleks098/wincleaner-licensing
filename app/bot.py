@@ -204,7 +204,7 @@ def get_main_keyboard(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
 
 
 def get_tariffs_inline_keyboard() -> InlineKeyboardMarkup:
-    """Tariff selection keyboard with pricing and direct booking."""
+    """Tariff selection keyboard with pricing, HWID reset, and direct booking."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🌟 1 месяц — 299 ₽", callback_data="buy_tariff:month:299"),
@@ -212,6 +212,9 @@ def get_tariffs_inline_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="👑 Lifetime (Навсегда) — 1 990 ₽", callback_data="buy_tariff:lifetime:1990")
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Сброс HWID / Перенос ПК — 150 ₽", callback_data="buy_tariff:hwid:150")
         ],
         [
             InlineKeyboardButton(text="💬 Задать вопрос по оплате / Другие способы", callback_data="user_open_support_buy")
@@ -423,10 +426,31 @@ async def handle_my_license(message: Message):
             )
 
             kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Отвязать ПК (сбросить HWID)", callback_data=f"user_unbind_key:{lic.license_key}")],
+                [InlineKeyboardButton(text="🔄 Сбросить HWID для этого ключа (150 ₽)", callback_data=f"user_req_hwid_key:{lic.license_key}")],
                 [InlineKeyboardButton(text="⚡ Инструкция по активации", callback_data="nav_how_activate")]
             ])
             await message.answer(card, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("user_req_hwid_key:"))
+async def cb_user_req_hwid_key(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1].strip()
+    text = (
+        f"🔄 <b>Заказ сброса HWID для ключа:</b> <code>{key}</code>\n\n"
+        "💰 <b>Стоимость услуги:</b> <b>150 ₽</b>\n\n"
+        "Сброс привязки необходим, если вы:\n"
+        "• Переустановили Windows или отформатировали диск\n"
+        "• Заменили материнскую плату, процессор или SSD\n"
+        "• Хотите перенести программу на другой компьютер\n\n"
+        "После подтверждения оплаты оператор моментально сбросит привязанные ПК, "
+        "и вы сможете активировать ключ на новом оборудовании!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить 150 ₽ (СБП / Карта)", callback_data=f"buy_tariff:hwid_key_{key}:150")],
+        [InlineKeyboardButton(text="🔙 Назад к лицензиям", callback_data="nav_my_license")]
+    ])
+    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
 
 
 @router.message(F.text == "💳 Купить лицензию")
@@ -442,10 +466,11 @@ async def handle_buy_license(message: Message):
         "  └ Целый год безупречной и быстрой работы вашей Windows + приоритет.\n\n"
         "• 👑 <b>Lifetime — 1 990 ₽</b> (2 ПК) — ♾️ <b>Навсегда!</b>\n"
         "  └ Бессрочный доступ для 2 ваших компьютеров, пожизненные обновления.\n\n"
+        "• 🔄 <b>Сброс HWID / Перенос ПК — 150 ₽</b>\n"
+        "  └ Перенос лицензии при смене оборудования или переустановке Windows.\n\n"
         "✨ <b>В каждый тариф входит:</b>\n"
         "✅ Удаление всего системного мусора и следов шпионажа\n"
         "✅ Оптимизация сети, пинга и оперативной памяти\n"
-        "✅ Свободный перенос лицензии при переустановке Windows\n"
         "✅ Полная техническая поддержка 24/7 прямо в этом боте\n\n"
         "Выберите желаемый тариф ниже ⬇️"
     )
@@ -478,9 +503,14 @@ async def cb_buy_tariff(callback: CallbackQuery):
     tariff_titles = {
         "month": "1 месяц (1 ПК)",
         "year": "1 год (1 ПК) — Хит продаж",
-        "lifetime": "Lifetime Навсегда (2 ПК)"
+        "lifetime": "Lifetime Навсегда (2 ПК)",
+        "hwid": "Сброс HWID / Перенос ПК"
     }
-    tariff_name = tariff_titles.get(tariff_code, tariff_code)
+    if tariff_code.startswith("hwid_key_"):
+        k = tariff_code.replace("hwid_key_", "")
+        tariff_name = f"Сброс HWID для {k}"
+    else:
+        tariff_name = tariff_titles.get(tariff_code, tariff_code)
 
     user_id = callback.from_user.id
     user_name = callback.from_user.full_name or "Пользователь"
@@ -509,69 +539,91 @@ async def cb_buy_tariff(callback: CallbackQuery):
             ticket_id=ticket.id,
             sender_type="user",
             sender_telegram_id=user_id,
-            text=f"Выбран тариф: {tariff_name} за {price} ₽"
+            text=f"Выбран заказ: {tariff_name} за {price} ₽"
         )
         db.add(msg_record)
         await db.commit()
         ticket_id = ticket.id
 
-    # Alert administrators with user details and instant key issue button
-    days_map = {"month": 30, "year": 365, "lifetime": 36500}
-    devs_map = {"month": 1, "year": 1, "lifetime": 2}
-    issued_days = days_map.get(tariff_code, 30)
-    issued_devs = devs_map.get(tariff_code, 1)
+    is_hwid = "hwid" in tariff_code
+    if is_hwid:
+        admin_alert_text = (
+            "🔄 <b>НОВАЯ ЗАЯВКА НА СБРОС HWID (150 ₽)!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>Клиент:</b> {escape_html(user_name)} ({user_uname})\n"
+            f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
+            f"📦 <b>Услуга:</b> <b>{tariff_name}</b>\n"
+            f"💰 <b>Сумма к оплате:</b> <b>150 ₽</b>\n"
+            f"📅 <b>Время:</b> {utc_now().strftime('%d.%m.%Y %H:%M')} UTC\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>После подтверждения оплаты нажмите кнопку сброса ниже:</i>"
+        )
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Сбросить HWID клиенту", callback_data=f"admin_act_unbind_user:{user_id}"),
+                InlineKeyboardButton(text="✍️ Ответить клиенту", callback_data=f"admin_prompt_reply:{user_id}")
+            ],
+            [
+                InlineKeyboardButton(text="👤 Досье клиента", callback_data=f"admin_dossier:{user_id}"),
+                InlineKeyboardButton(text="🔒 Закрыть заявку", callback_data=f"admin_close_ticket:{ticket_id}")
+            ]
+        ])
+    else:
+        days_map = {"month": 30, "year": 365, "lifetime": 36500}
+        devs_map = {"month": 1, "year": 1, "lifetime": 2}
+        issued_days = days_map.get(tariff_code, 30)
+        issued_devs = devs_map.get(tariff_code, 1)
 
-    admin_alert_text = (
-        "🛍️ <b>НОВАЯ ЗАЯВКА НА ПОКУПКУ ЛИЦЕНЗИИ!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>Клиент:</b> {escape_html(user_name)} ({user_uname})\n"
-        f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
-        f"📦 <b>Тариф:</b> <b>{tariff_name}</b>\n"
-        f"💰 <b>Сумма к оплате:</b> <b>{price} ₽</b>\n"
-        f"📅 <b>Время заявки:</b> {utc_now().strftime('%d.%m.%Y %H:%M')} UTC\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Вы можете нажать кнопку ниже для мгновенной выдачи ключа клиенту или ответить текстом:</i>"
-    )
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text=f"⚡ Выдать ключ ({price} ₽)",
-                callback_data=f"admin_quick_issue:{user_id}:{issued_days}:{issued_devs}"
-            ),
-            InlineKeyboardButton(
-                text="✍️ Ответить клиенту",
-                callback_data=f"admin_prompt_reply:{user_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(text="👤 Досье клиента", callback_data=f"admin_dossier:{user_id}"),
-            InlineKeyboardButton(text="🔒 Закрыть заявку", callback_data=f"admin_close_ticket:{ticket_id}")
-        ]
-    ])
+        admin_alert_text = (
+            "🛍️ <b>НОВАЯ ЗАЯВКА НА ПОКУПКУ ЛИЦЕНЗИИ!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>Клиент:</b> {escape_html(user_name)} ({user_uname})\n"
+            f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
+            f"📦 <b>Тариф:</b> <b>{tariff_name}</b>\n"
+            f"💰 <b>Сумма к оплате:</b> <b>{price} ₽</b>\n"
+            f"📅 <b>Время заявки:</b> {utc_now().strftime('%d.%m.%Y %H:%M')} UTC\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Вы можете нажать кнопку ниже для мгновенной выдачи ключа клиенту или ответить текстом:</i>"
+        )
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"⚡ Выдать ключ ({price} ₽)",
+                    callback_data=f"admin_quick_issue:{user_id}:{issued_days}:{issued_devs}"
+                ),
+                InlineKeyboardButton(
+                    text="✍️ Ответить клиенту",
+                    callback_data=f"admin_prompt_reply:{user_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(text="👤 Досье клиента", callback_data=f"admin_dossier:{user_id}"),
+                InlineKeyboardButton(text="🔒 Закрыть заявку", callback_data=f"admin_close_ticket:{ticket_id}")
+            ]
+        ])
 
     await send_admin_alert(admin_alert_text, reply_markup=admin_kb, ticket_context=(user_id, ticket_id))
 
     # User confirmation message
     user_reply = (
-        f"🛍️ <b>Вы выбрали тариф: {tariff_name} — {price} ₽</b>\n\n"
+        f"🛍️ <b>Вы выбрали: {tariff_name} — {price} ₽</b>\n\n"
         "💳 <b>Доступные способы оплаты:</b>\n"
         "• <b>СБП (Система быстрых платежей) / Перевод на карту</b>\n"
         "• <b>Криптовалюта (USDT TRC-20, TON, BTC)</b>\n"
-        "• <b>ЮMoney / Любые российские и зарубежные карты</b>\n\n"
-        "💬 <b>Как завершить оплату?</b>\n"
-        "Напишите прямо в этот чат удобный для вас банк или способ оплаты (например: <i>«СБП Тинькофф»</i> или <i>«USDT»</i>), "
+        "• <b>ЮMoney / Любые карты РФ и СНГ</b>\n\n"
+        "💬 <b>Как завершить заказ?</b>\n"
+        "Напишите прямо в этот чат удобный для вас способ оплаты (например: <i>«СБП»</i> или <i>«USDT»</i>), "
         "либо просто отправьте скриншот чека об оплате.\n\n"
-        "Оператор поддержки ответит вам прямо в этом диалоге и сразу выдаст лицензионный ключ!"
+        "Оператор поддержки ответит вам прямо в этом диалоге и сразу подтвердит выполнение!"
     )
 
     user_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Написать оператору реквизиты", callback_data="user_start_ticket")],
+        [InlineKeyboardButton(text="✍️ Написать оператору", callback_data="user_start_ticket")],
         [InlineKeyboardButton(text="🔙 Назад к тарифам", callback_data="nav_tariffs")]
     ])
 
     await callback.message.answer(user_reply, reply_markup=user_kb, parse_mode="HTML")
-    await callback.answer("Заявка зарегистрирована!")
+    await callback.answer("Заявка принята!")
 
 
 @router.message(F.text == "⚡ Как активировать")
@@ -689,18 +741,82 @@ async def handle_transfer_license(message: Message):
             dev_count += (await db.execute(dev_stmt)).scalar() or 0
 
         text = (
-            "🔄 <b>Перенос лицензии на новый компьютер:</b>\n\n"
+            "🔄 <b>Перенос лицензии и сброс HWID:</b>\n\n"
             f"Сейчас на ваших лицензиях привязано устройств: <b>{dev_count}</b>.\n\n"
-            "Если вы переустановили Windows, сменили материнскую плату или купили новый ПК, "
-            "нажмите кнопку подтверждения ниже. Привязка старых ПК будет моментально снята, "
+            "💰 <b>Стоимость услуги:</b> <b>150 ₽</b>\n\n"
+            "Сброс привязки необходим, если вы:\n"
+            "• Переустановили Windows или отформатировали диск\n"
+            "• Заменили материнскую плату, процессор или SSD\n"
+            "• Хотите перенести программу на другой компьютер\n\n"
+            "После подтверждения оплаты 150 ₽ оператор моментально сбросит привязку, "
             "и вы сможете активировать ваш ключ на новом оборудовании!"
         )
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да, сбросить привязку устройств", callback_data="user_do_unbind_all")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="user_cancel_action")]
+            [InlineKeyboardButton(text="💳 Оплатить сброс HWID (150 ₽)", callback_data="buy_tariff:hwid:150")],
+            [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="user_start_ticket")]
         ])
         await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("admin_act_unbind_user:"))
+async def cb_admin_act_unbind_user(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id, callback.from_user.username):
+        await callback.answer("⛔ Доступ запрещен.", show_alert=True)
+        return
+
+    target_id = int(callback.data.split(":")[1])
+    async with AsyncSessionLocal() as db:
+        u_res = await db.execute(select(User).where(User.telegram_id == target_id))
+        user = u_res.scalar_one_or_none()
+        if not user:
+            await callback.answer("Пользователь не найден.")
+            return
+
+        lic_stmt = select(License).where(License.user_id == user.id, License.status == "active")
+        lic_res = await db.execute(lic_stmt)
+        licenses = lic_res.scalars().all()
+
+        unbound_count = 0
+        for lic in licenses:
+            dev_stmt = select(Device).where(Device.license_id == lic.id, Device.is_active == True)
+            dev_res = await db.execute(dev_stmt)
+            for d in dev_res.scalars().all():
+                d.is_active = False
+                unbound_count += 1
+
+        log = ActivationLog(
+            license_id=None,
+            hwid="PAID_HWID_RESET_150",
+            action="transfer",
+            ip_address="telegram_admin_ui",
+            success=True,
+            details=f"Admin {callback.from_user.id} unbound {unbound_count} devices for user {target_id} (Paid 150 RUB)"
+        )
+        db.add(log)
+        await db.commit()
+
+    bot = get_bot_instance()
+    user_confirm = (
+        "✅ <b>Привязка HWID успешно сброшена!</b>\n\n"
+        "Оплата 150 ₽ подтверждена. Теперь вы можете открыть WinCleaner на новом компьютере "
+        "и ввести ваш ключ — он активируется без проблем!"
+    )
+    user_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔑 Мои лицензии", callback_data="nav_my_license")]
+    ])
+    try:
+        if bot:
+            await bot.send_message(target_id, user_confirm, reply_markup=user_kb, parse_mode="HTML")
+            delivery = "✅ Клиент уведомлен в ЛС"
+    except Exception as e:
+        delivery = f"⚠️ Ошибка отправки в ЛС: {escape_html(str(e))}"
+
+    await callback.answer("HWID сброшен!")
+    await callback.message.reply(
+        f"✅ <b>HWID сброшен (отвязано {unbound_count} ПК) для клиента <code>{target_id}</code>!</b>\n{delivery}",
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data == "user_confirm_unbind_all")
@@ -755,49 +871,8 @@ async def cb_user_do_unbind_all(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("user_unbind_key:"))
 async def cb_user_unbind_single_key(callback: CallbackQuery):
     key = callback.data.split(":", 1)[1].strip()
-    tg_id = callback.from_user.id
-
-    async with AsyncSessionLocal() as db:
-        u_res = await db.execute(select(User).where(User.telegram_id == tg_id))
-        user = u_res.scalar_one_or_none()
-        if not user:
-            await callback.answer("Пользователь не найден.")
-            return
-
-        lic_stmt = select(License).where(License.license_key == key, License.user_id == user.id)
-        lic_res = await db.execute(lic_stmt)
-        lic = lic_res.scalar_one_or_none()
-
-        if not lic:
-            await callback.answer("Лицензия не принадлежит вашему аккаунту.", show_alert=True)
-            return
-
-        dev_stmt = select(Device).where(Device.license_id == lic.id, Device.is_active == True)
-        dev_res = await db.execute(dev_stmt)
-        devs = dev_res.scalars().all()
-
-        unbound_count = len(devs)
-        for d in devs:
-            d.is_active = False
-
-        if unbound_count > 0:
-            log = ActivationLog(
-                license_id=lic.id,
-                hwid="USER_KEY_RESET",
-                action="transfer",
-                ip_address="telegram_bot",
-                success=True,
-                details=f"User {tg_id} unbound {unbound_count} devices for key {key}"
-            )
-            db.add(log)
-            await db.commit()
-
-    await callback.answer(f"✅ Отвязано устройств: {unbound_count}!", show_alert=True)
-    await callback.message.answer(
-        f"✅ <b>Устройства для ключа <code>{key}</code> успешно отвязаны!</b>\n"
-        "Вы можете активировать этот ключ на новом ПК прямо сейчас.",
-        parse_mode="HTML"
-    )
+    callback.data = f"user_req_hwid_key:{key}"
+    await cb_user_req_hwid_key(callback)
 
 
 @router.callback_query(F.data == "user_cancel_action")
@@ -849,9 +924,9 @@ async def cb_user_faq(callback: CallbackQuery):
         "WinCleaner использует глубокие системные функции очистки реестра и сетевых служб, "
         "поэтому некоторые параноидальные антивирусы могут выдать ложное срабатывание (False Positive). "
         "Добавьте программу в исключения или запускайте от имени администратора.\n\n"
-        "🔹 <b>Что если я переустановил Windows?</b>\n"
-        "Просто нажмите <b>«🔄 Перенести лицензию»</b> в этом боте, привязка сбросится, "
-        "и вы сможете использовать тот же ключ снова!\n\n"
+        "🔹 <b>Что если я переустановил Windows или сменил ПК?</b>\n"
+        "Перенос лицензии на новый компьютер или после переустановки Windows со сбросом HWID стоит всего 150 ₽. "
+        "Нажмите <b>«🔄 Перенести лицензию»</b> в меню бота для оформления заказа.\n\n"
         "🔹 <b>Нужен ли постоянный интернет?</b>\n"
         "Интернет нужен только один раз во время активации и валидации ключа. Далее приложение работает офлайн.\n\n"
         "🔹 <b>Как оплатить?</b>\n"

@@ -1,6 +1,5 @@
 import os
-import math
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets", "banners")
 os.makedirs(ASSETS_DIR, exist_ok=True)
@@ -23,7 +22,33 @@ def draw_rounded_rect(draw, bbox, radius, fill=None, outline=None, width=1):
     x0, y0, x1, y1 = bbox
     draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=fill, outline=outline, width=width)
 
-def create_gradient(width, height, color_top, color_bottom, color_accent=None):
+def draw_text_wrapped(draw, text, font, x, y, max_width, line_spacing, fill):
+    lines = []
+    for para in text.split("\n"):
+        words = para.split(" ")
+        cur_line = []
+        for word in words:
+            test_line = " ".join(cur_line + [word])
+            bbox = font.getbbox(test_line)
+            w = bbox[2] - bbox[0]
+            if w <= max_width:
+                cur_line.append(word)
+            else:
+                if cur_line:
+                    lines.append(" ".join(cur_line))
+                    cur_line = [word]
+                else:
+                    lines.append(word)
+        if cur_line:
+            lines.append(" ".join(cur_line))
+    
+    cur_y = y
+    for line in lines:
+        draw.text((x, cur_y), line, font=font, fill=fill)
+        cur_y += line_spacing
+    return cur_y
+
+def create_base_canvas(width, height, color_top, color_bottom, accent_glow=None):
     base = Image.new("RGBA", (width, height), color_top)
     draw = ImageDraw.Draw(base)
     for y in range(height):
@@ -33,228 +58,241 @@ def create_gradient(width, height, color_top, color_bottom, color_accent=None):
         b = int(color_top[2] * (1 - factor) + color_bottom[2] * factor)
         draw.line([(0, y), (width, y)], fill=(r, g, b, 255))
     
-    # Overlay subtle accent glow
-    if color_accent:
+    # Ambient corner glow
+    if accent_glow:
         glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         gdraw = ImageDraw.Draw(glow)
-        cx, cy = int(width * 0.85), int(height * 0.25)
-        for rad in range(160, 0, -8):
-            alpha = int((1 - rad / 160) * 45)
-            gdraw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=(*color_accent[:3], alpha))
+        cx, cy = int(width * 0.88), int(height * 0.22)
+        for rad in range(180, 0, -8):
+            alpha = int((1 - rad / 180) * 45)
+            gdraw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=(*accent_glow[:3], alpha))
         base = Image.alpha_composite(base, glow)
-    
-    # Subtle cyber grid dots
-    grid_overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    gdraw = ImageDraw.Draw(grid_overlay)
-    for x in range(20, width, 40):
-        for y in range(20, height, 40):
-            gdraw.ellipse([x - 1, y - 1, x + 1, y + 1], fill=(255, 255, 255, 18))
-    base = Image.alpha_composite(base, grid_overlay)
+
+    # Subtle grid dots (spacious, low opacity)
+    grid = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    gdraw = ImageDraw.Draw(grid)
+    for x in range(30, width, 40):
+        for y in range(30, height, 40):
+            gdraw.ellipse([x - 1, y - 1, x + 1, y + 1], fill=(255, 255, 255, 12))
+    base = Image.alpha_composite(base, grid)
     return base
 
+
 def generate_main_banner():
-    width, height = 800, 400
-    img = create_gradient(width, height, (11, 15, 25), (15, 23, 42), (0, 210, 255))
+    width, height = 960, 500
+    img = create_base_canvas(width, height, (10, 15, 26), (15, 23, 42), (0, 210, 255))
     draw = ImageDraw.Draw(img)
 
-    # Frame border
-    draw_rounded_rect(draw, [15, 15, width - 15, height - 15], 16, outline=(0, 210, 255, 80), width=2)
-    
-    # Glow badge: "OFFICIAL BOT"
-    draw_rounded_rect(draw, [40, 40, 190, 72], 16, fill=(0, 210, 255, 30), outline=(0, 210, 255, 180), width=1)
-    badge_font = get_font(14, bold=True)
-    draw.text((60, 48), "🛡️ OFFICIAL BOT", font=badge_font, fill=(0, 225, 255))
+    # Outer border
+    draw_rounded_rect(draw, [16, 16, width - 16, height - 16], 18, outline=(0, 210, 255, 80), width=2)
 
-    # Version badge
-    draw_rounded_rect(draw, [205, 40, 315, 72], 16, fill=(121, 40, 202, 35), outline=(147, 51, 234, 180), width=1)
-    draw.text((225, 48), "⚡ v2.0 PRO", font=badge_font, fill=(192, 132, 252))
+    # Badges (No emojis in text!)
+    draw_rounded_rect(draw, [40, 36, 185, 72], 18, fill=(0, 210, 255, 30), outline=(0, 210, 255, 180), width=1)
+    draw.text((58, 45), "OFFICIAL BOT", font=get_font(13, bold=True), fill=(0, 230, 255))
 
-    # Title
-    title_font = get_font(38, bold=True)
-    draw.text((40, 95), "WinCleaner Security & Control", font=title_font, fill=(255, 255, 255))
+    draw_rounded_rect(draw, [198, 36, 310, 72], 18, fill=(147, 51, 234, 35), outline=(168, 85, 247, 180), width=1)
+    draw.text((216, 45), "v2.0 PRO", font=get_font(13, bold=True), fill=(216, 180, 254))
 
-    # Subtitle
-    sub_font = get_font(18, bold=False)
-    draw.text((40, 150), "Официальный центр управления лицензиями и устройствами", font=sub_font, fill=(148, 163, 184))
+    # Title & Subtitle
+    draw.text((40, 92), "WinCleaner Security & Control", font=get_font(36, bold=True), fill=(255, 255, 255))
+    draw.text((40, 145), "Официальный центр управления лицензиями и оптимизацией Windows", font=get_font(17, bold=False), fill=(203, 213, 225))
 
-    # 3 Feature cards
-    features = [
-        ("⚡ Мгновенная активация", "Автопривязка HWID ПК за секунду"),
-        ("🔄 Свободный перенос", "1-клик сброс при смене Windows или ПК"),
-        ("🛡️ Анонимная поддержка", "Прямая связь с разработчиками 24/7")
+    # 3 Cards
+    cards = [
+        ("Мгновенная активация", "Автоматическая привязка к вашему ПК за пару секунд без ожидания"),
+        ("Смена ПК / Сброс HWID", "Перенос лицензии на новый компьютер или после переустановки Windows — 150 ₽"),
+        ("Анонимная поддержка", "Прямая связь с оператором прямо в диалоге бота 24/7 без раскрытия данных")
     ]
-    
-    card_width = 224
-    card_height = 110
+
+    card_w = 276
+    card_h = 175
     start_x = 40
-    card_y = 205
+    card_y = 200
 
-    for i, (f_title, f_desc) in enumerate(features):
-        cx = start_x + i * (card_width + 24)
-        draw_rounded_rect(draw, [cx, card_y, cx + card_width, card_y + card_height], 12,
-                          fill=(25, 35, 55, 200), outline=(56, 189, 248, 70), width=1)
-        draw.text((cx + 14, card_y + 18), f_title, font=get_font(15, bold=True), fill=(241, 245, 249))
-        draw.text((cx + 14, card_y + 48), f_desc, font=get_font(13, bold=False), fill=(148, 163, 184))
+    for i, (head, body) in enumerate(cards):
+        cx = start_x + i * (card_w + 24)
+        is_hwid = (i == 1)
+        border_col = (56, 189, 248, 180) if is_hwid else (56, 189, 248, 80)
+        bg_col = (26, 40, 68, 240) if is_hwid else (20, 30, 50, 220)
+        draw_rounded_rect(draw, [cx, card_y, cx + card_w, card_y + card_h], 14, fill=bg_col, outline=border_col, width=2 if is_hwid else 1)
 
-    # Bottom status bar
-    draw_rounded_rect(draw, [40, 340, width - 40, 375], 8, fill=(15, 23, 42, 220), outline=(30, 41, 59, 255), width=1)
-    status_font = get_font(13, bold=False)
-    draw.text((55, 348), "🟢 Сервер лицензирования: Online  |  🔒 Шифрование: Ed25519  |  🤖 Aiogram 3.x", font=status_font, fill=(52, 211, 153))
+        # Highlight tag on HWID card
+        if is_hwid:
+            draw_rounded_rect(draw, [cx + card_w - 75, card_y + 12, cx + card_w - 14, card_y + 34], 6, fill=(56, 189, 248, 50), outline=(56, 189, 248, 200))
+            draw.text((cx + card_w - 65, card_y + 15), "150 ₽", font=get_font(12, bold=True), fill=(56, 189, 248))
+
+        draw.text((cx + 18, card_y + 18), head, font=get_font(16, bold=True), fill=(255, 255, 255))
+        draw_text_wrapped(draw, body, get_font(13, bold=False), cx + 18, card_y + 58, card_w - 36, 22, (203, 213, 225))
+
+    # Clean bottom highlight bar (NO dev jargon!)
+    draw_rounded_rect(draw, [40, 405, width - 40, 455], 10, fill=(15, 23, 42, 230), outline=(56, 189, 248, 60), width=1)
+    
+    # Draw green dot
+    draw.ellipse([60, 427, 68, 435], fill=(74, 222, 128))
+    draw.text((80, 420), "Глубокая очистка системы  •  Оптимизация реестра  •  Защита приватности  •  Поддержка 24/7",
+              font=get_font(14, bold=True), fill=(241, 245, 249))
 
     out_path = os.path.join(ASSETS_DIR, "banner_main.png")
     img.convert("RGB").save(out_path, "PNG", quality=95)
     print(f"Generated: {out_path}")
 
+
 def generate_tariffs_banner():
-    width, height = 800, 400
-    img = create_gradient(width, height, (15, 12, 28), (24, 18, 43), (168, 85, 247))
+    width, height = 960, 540
+    img = create_base_canvas(width, height, (16, 12, 32), (24, 18, 48), (168, 85, 247))
     draw = ImageDraw.Draw(img)
 
     # Frame border
-    draw_rounded_rect(draw, [15, 15, width - 15, height - 15], 16, outline=(168, 85, 247, 80), width=2)
+    draw_rounded_rect(draw, [16, 16, width - 16, height - 16], 18, outline=(168, 85, 247, 90), width=2)
 
     # Header badge
-    draw_rounded_rect(draw, [40, 35, 210, 67], 16, fill=(168, 85, 247, 30), outline=(168, 85, 247, 180), width=1)
-    draw.text((58, 43), "💳 ОФИЦИАЛЬНЫЕ ТАРИФЫ", font=get_font(13, bold=True), fill=(216, 180, 254))
+    draw_rounded_rect(draw, [40, 32, 220, 68], 18, fill=(168, 85, 247, 40), outline=(168, 85, 247, 190), width=1)
+    draw.text((58, 42), "ОФИЦИАЛЬНЫЕ ТАРИФЫ", font=get_font(13, bold=True), fill=(233, 213, 255))
 
-    # Title
-    title_font = get_font(32, bold=True)
-    draw.text((40, 80), "Выберите подходящую лицензию", font=title_font, fill=(255, 255, 255))
-    draw.text((40, 125), "Все тарифы включают полный доступ к функционалу WinCleaner и авто-обновлениям", font=get_font(14, bold=False), fill=(167, 139, 250))
+    # Title & Subtitle
+    draw.text((40, 84), "Выберите подходящую лицензию", font=get_font(34, bold=True), fill=(255, 255, 255))
+    draw.text((40, 132), "Все лицензии включают полный доступ к функционалу WinCleaner и авто-обновлениям", font=get_font(15, bold=False), fill=(216, 180, 254))
 
     # 3 Tariff Cards
     tariffs = [
-        ("🌟 1 МЕСЯЦ", "299 ₽", "1 ПК", "Быстрый старт\nПолный доступ\nСтандартная поддержка", False),
-        ("🚀 1 ГОД", "990 ₽", "1 ПК", "ХИТ ПРОДАЖ!\nЭкономия 72%\nПриоритетный саппорт", True),
-        ("👑 LIFETIME", "1 990 ₽", "2 ПК", "Навсегда (без лимита)\n2 компьютера\nVIP обновления", False)
+        ("1 МЕСЯЦ", "299 ₽", "1 компьютер", "Быстрый старт\nПолная очистка и разгон\nСтандартная поддержка", False),
+        ("1 ГОД", "990 ₽", "1 компьютер", "ХИТ ПРОДАЖ (Экономия 72%)\nЦелый год чистой Windows\nПриоритетный саппорт 24/7", True),
+        ("LIFETIME", "1 990 ₽", "2 компьютера", "Бессрочно (Навсегда)\nДля 2 ваших компьютеров\nVIP пожизненный доступ", False)
     ]
 
-    card_width = 224
-    card_height = 205
+    card_w = 276
+    card_h = 240
     start_x = 40
-    card_y = 160
+    card_y = 168
 
     for i, (name, price, pcs, desc, is_hit) in enumerate(tariffs):
-        cx = start_x + i * (card_width + 24)
-        border_color = (234, 179, 8, 220) if is_hit else (168, 85, 247, 90)
-        bg_color = (38, 28, 62, 230) if is_hit else (24, 20, 42, 210)
-        
-        draw_rounded_rect(draw, [cx, card_y, cx + card_width, card_y + card_height], 14,
-                          fill=bg_color, outline=border_color, width=2 if is_hit else 1)
+        cx = start_x + i * (card_w + 24)
+        border_col = (250, 204, 21, 230) if is_hit else (168, 85, 247, 100)
+        bg_col = (42, 30, 70, 240) if is_hit else (28, 22, 50, 220)
 
+        draw_rounded_rect(draw, [cx, card_y, cx + card_w, card_y + card_h], 14, fill=bg_col, outline=border_col, width=2 if is_hit else 1)
+
+        # Hit badge
         if is_hit:
-            draw_rounded_rect(draw, [cx + 120, card_y - 12, cx + card_width - 10, card_y + 12], 8,
-                              fill=(234, 179, 8, 255))
-            draw.text((cx + 128, card_y - 8), "ТОП ВЫБОР", font=get_font(11, bold=True), fill=(0, 0, 0))
+            draw_rounded_rect(draw, [cx + card_w - 110, card_y + 12, cx + card_w - 14, card_y + 36], 6, fill=(250, 204, 21, 255))
+            draw.text((cx + card_w - 98, card_y + 16), "ТОП ВЫБОР", font=get_font(11, bold=True), fill=(15, 23, 42))
 
-        # Tariff name
-        draw.text((cx + 16, card_y + 16), name, font=get_font(16, bold=True), fill=(243, 232, 255) if not is_hit else (254, 240, 138))
-        
-        # Price
-        draw.text((cx + 16, card_y + 44), price, font=get_font(28, bold=True), fill=(255, 255, 255))
-        
-        # Devices badge
-        draw_rounded_rect(draw, [cx + 16, card_y + 88, cx + 80, card_y + 110], 6, fill=(147, 51, 234, 40), outline=(147, 51, 234, 150))
-        draw.text((cx + 25, card_y + 92), pcs, font=get_font(12, bold=True), fill=(216, 180, 254))
+        draw.text((cx + 18, card_y + 18), name, font=get_font(18, bold=True), fill=(254, 240, 138) if is_hit else (255, 255, 255))
+        draw.text((cx + 18, card_y + 48), price, font=get_font(32, bold=True), fill=(255, 255, 255))
 
-        # Bullet points
+        # Device badge
+        draw_rounded_rect(draw, [cx + 18, card_y + 98, cx + 155, card_y + 124], 6, fill=(168, 85, 247, 40), outline=(168, 85, 247, 140))
+        draw.text((cx + 26, card_y + 102), pcs, font=get_font(12, bold=True), fill=(233, 213, 255))
+
+        # Bullets with custom dots
         lines = desc.split("\n")
         for line_idx, line in enumerate(lines):
-            draw.text((cx + 16, card_y + 125 + line_idx * 24), f"• {line}", font=get_font(13, bold=False), fill=(203, 213, 225))
+            ly = card_y + 140 + line_idx * 30
+            dot_color = (250, 204, 21) if is_hit else (168, 85, 247)
+            draw.ellipse([cx + 18, ly + 6, cx + 24, ly + 12], fill=dot_color)
+            draw.text((cx + 32, ly), line, font=get_font(12, bold=False), fill=(241, 245, 249))
+
+    # Prominent Wide HWID Reset Card at bottom
+    hwid_y = 428
+    draw_rounded_rect(draw, [40, hwid_y, width - 40, hwid_y + 82], 12, fill=(22, 34, 60, 240), outline=(56, 189, 248, 160), width=2)
+    
+    # Left tag: 150 ₽
+    draw_rounded_rect(draw, [56, hwid_y + 18, 155, hwid_y + 64], 8, fill=(56, 189, 248, 35), outline=(56, 189, 248, 200), width=1)
+    draw.text((72, hwid_y + 26), "150 ₽", font=get_font(22, bold=True), fill=(56, 189, 248))
+
+    draw.text((175, hwid_y + 18), "ПЕРЕНОС ЛИЦЕНЗИИ / СБРОС ПРИВЯЗКИ HWID", font=get_font(15, bold=True), fill=(255, 255, 255))
+    draw.text((175, hwid_y + 44), "Смена материнской платы, переустановка Windows или перенос на другой ПК — заказывается в боте",
+              font=get_font(13, bold=False), fill=(203, 213, 225))
 
     out_path = os.path.join(ASSETS_DIR, "banner_tariffs.png")
     img.convert("RGB").save(out_path, "PNG", quality=95)
     print(f"Generated: {out_path}")
 
+
 def generate_support_banner():
-    width, height = 800, 400
-    img = create_gradient(width, height, (10, 20, 30), (15, 30, 45), (14, 165, 233))
+    width, height = 960, 500
+    img = create_base_canvas(width, height, (10, 20, 32), (16, 28, 46), (14, 165, 233))
     draw = ImageDraw.Draw(img)
 
     # Frame border
-    draw_rounded_rect(draw, [15, 15, width - 15, height - 15], 16, outline=(14, 165, 233, 80), width=2)
+    draw_rounded_rect(draw, [16, 16, width - 16, height - 16], 18, outline=(14, 165, 233, 90), width=2)
 
-    # Badge
-    draw_rounded_rect(draw, [40, 35, 250, 67], 16, fill=(14, 165, 233, 30), outline=(14, 165, 233, 180), width=1)
-    draw.text((58, 43), "💬 СЛУЖБА ПОДДЕРЖКИ 24/7", font=get_font(13, bold=True), fill=(125, 211, 252))
+    # Header badge
+    draw_rounded_rect(draw, [40, 32, 250, 68], 18, fill=(14, 165, 233, 40), outline=(14, 165, 233, 190), width=1)
+    draw.text((58, 42), "СЛУЖБА ПОДДЕРЖКИ 24/7", font=get_font(13, bold=True), fill=(186, 230, 253))
 
-    # Title
-    title_font = get_font(34, bold=True)
-    draw.text((40, 85), "Центр заботы о пользователях", font=title_font, fill=(255, 255, 255))
-    draw.text((40, 135), "Напишите нам прямо в бота — оператор ответит вам без посредников", font=get_font(16, bold=False), fill=(148, 163, 184))
+    # Title & Subtitle
+    draw.text((40, 84), "Центр заботы о пользователях", font=get_font(34, bold=True), fill=(255, 255, 255))
+    draw.text((40, 132), "Напишите нам прямо в этот диалог — оператор поддержки ответит вам от лица бота", font=get_font(16, bold=False), fill=(203, 213, 225))
 
-    # Support features
+    # Support features (Clean rendered bullets)
     items = [
-        ("🔒 Полная конфиденциальность", "Ваш диалог полностью защищен и изолирован внутри системы"),
-        ("⚡ Быстрый ответ специалиста", "Среднее время ответа оператора поддержки — до 15 минут"),
-        ("🛠️ Помощь по любым вопросам", "Активация, сброс HWID, перенос на новый ПК, ошибки Windows"),
-        ("📎 Отправка скриншотов и логов", "Вы можете просто отправить фото или файл лога прямо в чат")
+        ("Полная конфиденциальность", "Ваш диалог полностью защищен и изолирован внутри системы без раскрытия личных данных"),
+        ("Быстрый ответ специалиста", "Среднее время ответа оператора поддержки в чате — от 5 до 15 минут"),
+        ("Сброс HWID и смена оборудования (150 ₽)", "Помощь со сменой материнской платы, SSD/HDD или переустановкой Windows"),
+        ("Отправка скриншотов и файлов", "Вы можете просто прикрепить скриншот ошибки или текстовый лог прямо в этот чат")
     ]
 
     for idx, (head, sub) in enumerate(items):
-        y = 185 + idx * 48
-        draw.text((50, y), "•", font=get_font(20, bold=True), fill=(56, 189, 248))
-        draw.text((75, y), head, font=get_font(15, bold=True), fill=(241, 245, 249))
-        draw.text((75, y + 20), sub, font=get_font(13, bold=False), fill=(148, 163, 184))
+        y = 180 + idx * 70
+        # Card backing for each row
+        draw_rounded_rect(draw, [40, y, width - 40, y + 58], 10, fill=(18, 30, 50, 220), outline=(56, 189, 248, 60), width=1)
+
+        # Glowing cyan bullet
+        draw.ellipse([60, y + 23, 72, y + 35], fill=(56, 189, 248))
+
+        draw.text((88, y + 10), head, font=get_font(16, bold=True), fill=(255, 255, 255))
+        draw.text((88, y + 33), sub, font=get_font(13, bold=False), fill=(203, 213, 225))
 
     out_path = os.path.join(ASSETS_DIR, "banner_support.png")
     img.convert("RGB").save(out_path, "PNG", quality=95)
     print(f"Generated: {out_path}")
 
+
 def generate_activate_banner():
-    width, height = 800, 400
-    img = create_gradient(width, height, (16, 24, 39), (20, 30, 48), (34, 197, 94))
+    width, height = 960, 500
+    img = create_base_canvas(width, height, (14, 22, 34), (20, 32, 48), (34, 197, 94))
     draw = ImageDraw.Draw(img)
 
     # Frame border
-    draw_rounded_rect(draw, [15, 15, width - 15, height - 15], 16, outline=(34, 197, 94, 80), width=2)
+    draw_rounded_rect(draw, [16, 16, width - 16, height - 16], 18, outline=(34, 197, 94, 90), width=2)
 
     # Badge
-    draw_rounded_rect(draw, [40, 35, 230, 67], 16, fill=(34, 197, 94, 30), outline=(34, 197, 94, 180), width=1)
-    draw.text((58, 43), "⚡ БЫСТРАЯ АКТИВАЦИЯ", font=get_font(13, bold=True), fill=(134, 239, 172))
+    draw_rounded_rect(draw, [40, 32, 230, 68], 18, fill=(34, 197, 94, 40), outline=(34, 197, 94, 190), width=1)
+    draw.text((58, 42), "БЫСТРАЯ АКТИВАЦИЯ", font=get_font(13, bold=True), fill=(187, 247, 208))
 
-    # Title
-    title_font = get_font(34, bold=True)
-    draw.text((40, 85), "Как активировать WinCleaner", font=title_font, fill=(255, 255, 255))
-    draw.text((40, 135), "Всего 3 простых шага до чистой и быстрой операционной системы", font=get_font(16, bold=False), fill=(148, 163, 184))
+    # Title & Subtitle
+    draw.text((40, 84), "Как активировать WinCleaner", font=get_font(34, bold=True), fill=(255, 255, 255))
+    draw.text((40, 132), "Всего 3 простых шага до полностью оптимизированной и быстрой системы", font=get_font(16, bold=False), fill=(203, 213, 225))
 
     # Steps cards
     steps = [
-        ("Шаг 1", "Запустите файл", "Запустите файл программы WinCleaner.exe от имени администратора"),
-        ("Шаг 2", "Вставьте ключ", "В окне вставьте ваш лицензионный ключ вида WINC-XXXX-XXXX-XXXX"),
-        ("Шаг 3", "Готово!", "Нажмите «Активировать». Программа привяжет HWID и запустится!")
+        ("ШАГ 1", "Запустите программу", "Запустите файл WinCleaner.exe от имени администратора на вашем компьютере."),
+        ("ШАГ 2", "Вставьте ключ", "В появившемся окне вставьте ваш ключ вида WINC-XXXX-XXXX-XXXX."),
+        ("ШАГ 3", "Готово!", "Нажмите «Активировать». Программа привяжет ваш ПК и разблокирует весь функционал.")
     ]
 
-    card_width = 224
-    card_height = 165
+    card_w = 276
+    card_h = 210
     start_x = 40
-    card_y = 185
+    card_y = 180
 
     for i, (step_num, step_title, step_desc) in enumerate(steps):
-        cx = start_x + i * (card_width + 24)
-        draw_rounded_rect(draw, [cx, card_y, cx + card_width, card_y + card_height], 12,
-                          fill=(25, 38, 55, 220), outline=(34, 197, 94, 90), width=1)
-        
-        # Step number badge
-        draw_rounded_rect(draw, [cx + 14, card_y + 14, cx + 80, card_y + 40], 6, fill=(34, 197, 94, 40), outline=(34, 197, 94, 180))
-        draw.text((cx + 24, card_y + 18), step_num, font=get_font(12, bold=True), fill=(134, 239, 172))
+        cx = start_x + i * (card_w + 24)
+        draw_rounded_rect(draw, [cx, card_y, cx + card_w, card_y + card_h], 14, fill=(22, 36, 56, 230), outline=(34, 197, 94, 90), width=1)
 
-        draw.text((cx + 14, card_y + 52), step_title, font=get_font(16, bold=True), fill=(255, 255, 255))
-        
-        # Word wrap desc
-        lines = []
-        words = step_desc.split()
-        cur_line = []
-        for word in words:
-            cur_line.append(word)
-            if len(" ".join(cur_line)) > 24:
-                lines.append(" ".join(cur_line[:-1]))
-                cur_line = [word]
-        if cur_line:
-            lines.append(" ".join(cur_line))
-        
-        for l_idx, line in enumerate(lines):
-            draw.text((cx + 14, card_y + 82 + l_idx * 20), line, font=get_font(12, bold=False), fill=(148, 163, 184))
+        # Step badge
+        draw_rounded_rect(draw, [cx + 18, card_y + 18, cx + 90, card_y + 44], 6, fill=(34, 197, 94, 40), outline=(34, 197, 94, 180))
+        draw.text((cx + 28, card_y + 22), step_num, font=get_font(12, bold=True), fill=(187, 247, 208))
+
+        draw.text((cx + 18, card_y + 60), step_title, font=get_font(17, bold=True), fill=(255, 255, 255))
+        draw_text_wrapped(draw, step_desc, get_font(13, bold=False), cx + 18, card_y + 95, card_w - 36, 22, (203, 213, 225))
+
+    # Bottom note
+    draw_rounded_rect(draw, [40, 415, width - 40, 465], 10, fill=(18, 30, 48, 240), outline=(34, 197, 94, 70), width=1)
+    draw.ellipse([60, 437, 68, 445], fill=(34, 197, 94))
+    draw.text((80, 430), "При смене компьютера или переустановке Windows перенос лицензии (сброс HWID) — 150 ₽ в боте",
+              font=get_font(13, bold=True), fill=(241, 245, 249))
 
     out_path = os.path.join(ASSETS_DIR, "banner_activate.png")
     img.convert("RGB").save(out_path, "PNG", quality=95)
@@ -265,4 +303,4 @@ if __name__ == "__main__":
     generate_tariffs_banner()
     generate_support_banner()
     generate_activate_banner()
-    print("All banners generated successfully!")
+    print("All refreshed banners generated cleanly!")

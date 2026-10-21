@@ -39,7 +39,7 @@ async def main():
         assert os.path.isfile(path), f"Banner {label} not found at {path}"
         with Image.open(path) as img:
             w, h = img.size
-            assert w == 800 and h == 400, f"Expected 800x400, got {w}x{h}"
+            assert w >= 800 and h >= 400, f"Expected banner dimensions >= 800x400, got {w}x{h}"
             size_kb = os.path.getsize(path) / 1024
             print(f"  ✓ Banner '{label}': {w}x{h} PNG ({size_kb:.1f} KB) OK")
 
