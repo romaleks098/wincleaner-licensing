@@ -24,13 +24,38 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 async def _run_schema_migrations(conn):
+    """
+    Ensures all tables and schema changes are created reliably
+    without failing across different SQL dialects (SQLite & PostgreSQL).
+    """
+    # 1. Create all missing tables defined in Base.metadata
     await conn.run_sync(Base.metadata.create_all)
-    # Safe schema migration for existing databases
+
+    # 2. Add is_banned column to users table if missing
     try:
-        await conn.execute(text("ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT 0;"))
-    except Exception:
-        # Column already exists
-        pass
+        dialect_name = conn.dialect.name
+        if dialect_name == "postgresql":
+            # PostgreSQL dialect-safe migration
+            await conn.execute(text("""
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name = 'users' AND column_name = 'is_banned'
+                    ) THEN 
+                        ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT FALSE; 
+                    END IF; 
+                END $$;
+            """))
+        else:
+            # SQLite dialect-safe migration
+            res = await conn.execute(text("PRAGMA table_info(users);"))
+            rows = res.fetchall()
+            col_names = [r[1] for r in rows] if rows else []
+            if "is_banned" not in col_names:
+                await conn.execute(text("ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT 0;"))
+    except Exception as e:
+        logger.warning(f"Schema migration warning for is_banned column: {e}")
 
 async def init_db():
     global engine, AsyncSessionLocal
@@ -45,7 +70,7 @@ async def init_db():
             logger.warning(f"Database connection attempt {attempt} failed: {e}")
             await asyncio.sleep(2)
 
-    logger.warning("PostgreSQL unavailable — switching to local SQLite fallback database...")
+    logger.warning("Primary database unavailable — switching to local SQLite fallback database...")
     try:
         engine = create_async_engine("sqlite+aiosqlite:///./licensing.db", echo=False)
         AsyncSessionLocal.configure(bind=engine)

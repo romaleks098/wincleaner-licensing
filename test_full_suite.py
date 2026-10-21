@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PIL import Image
+from sqlalchemy import select
 from app.config import settings
 from app.database import init_db, AsyncSessionLocal
 from app.models import User, License, Device, ActivationLog, SupportTicket, TicketMessage
@@ -48,9 +49,13 @@ async def main():
     async with AsyncSessionLocal() as db:
         # Create test user
         test_uid = 999999991
-        u = User(telegram_id=test_uid, username="test_buyer", first_name="Test Customer")
-        db.add(u)
-        await db.flush()
+        u_stmt = select(User).where(User.telegram_id == test_uid)
+        res = await db.execute(u_stmt)
+        u = res.scalar_one_or_none()
+        if not u:
+            u = User(telegram_id=test_uid, username="test_buyer", first_name="Test Customer")
+            db.add(u)
+            await db.flush()
 
         # Create ticket
         t = SupportTicket(

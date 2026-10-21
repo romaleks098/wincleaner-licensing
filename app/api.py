@@ -20,7 +20,8 @@ from app.schemas import (
     AdminGenerateKeyRequest, AdminRevokeRequest, AdminExtendRequest
 )
 from app.crypto import sign_license, generate_key_string
-from app.bot import send_admin_alert, escape_html
+from app.bot import send_admin_alert, escape_html, get_bot_instance, get_dp_instance
+from aiogram.types import Update
 
 router = APIRouter(prefix="/api/v1", tags=["licensing"])
 
@@ -60,6 +61,77 @@ async def health_check():
         "service": "wincleaner-licensing",
         "server_time": datetime.utcnow().isoformat() + "Z",
         "public_key": settings.ED25519_PUBLIC_KEY_HEX
+    }
+
+@router.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    bot = get_bot_instance()
+    dp = get_dp_instance()
+    if not bot or not dp:
+        return {"status": "bot_not_ready"}
+    try:
+        data = await request.json()
+        telegram_update = Update.model_validate(data, context={"bot": bot})
+        asyncio.create_task(dp.feed_update(bot, telegram_update))
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@router.get("/diagnostics")
+async def diagnostics(db: AsyncSession = Depends(get_db)):
+    bot = get_bot_instance()
+    tables = []
+    users_columns = []
+    db_status = "ok"
+    try:
+        from sqlalchemy import text
+        # List tables
+        res = await db.execute(text("SELECT 1;"))
+        dialect = db.bind.dialect.name if hasattr(db, "bind") and db.bind else "unknown"
+        if dialect == "postgresql":
+            t_res = await db.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema='public';"))
+            tables = [r[0] for r in t_res.fetchall()]
+            c_res = await db.execute(text("SELECT column_name, data_type FROM information_schema.columns WHERE table_name='users';"))
+            users_columns = [f"{r[0]} ({r[1]})" for r in c_res.fetchall()]
+        else:
+            t_res = await db.execute(text("SELECT name FROM sqlite_master WHERE type='table';"))
+            tables = [r[0] for r in t_res.fetchall()]
+            c_res = await db.execute(text("PRAGMA table_info(users);"))
+            users_columns = [f"{r[1]} ({r[2]})" for r in c_res.fetchall()]
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+        dialect = "error"
+
+    webhook_info = "none"
+    if bot:
+        try:
+            wh = await bot.get_webhook_info()
+            webhook_info = {
+                "url": wh.url,
+                "has_custom_certificate": wh.has_custom_certificate,
+                "pending_update_count": wh.pending_update_count,
+                "last_error_message": wh.last_error_message,
+                "last_error_date": str(wh.last_error_date) if wh.last_error_date else None,
+            }
+        except Exception as e:
+            webhook_info = f"error: {str(e)}"
+
+    return {
+        "status": "ok",
+        "service": "wincleaner-licensing",
+        "server_time": datetime.utcnow().isoformat() + "Z",
+        "environment": settings.ENVIRONMENT,
+        "database": {
+            "status": db_status,
+            "dialect": dialect,
+            "tables": tables,
+            "users_columns": users_columns
+        },
+        "bot": {
+            "initialized": bot is not None,
+            "admin_count": len(settings.admin_ids),
+            "webhook": webhook_info
+        }
     }
 
 @router.post("/activate", response_model=ActivationResponse)

@@ -26,6 +26,7 @@ logger = logging.getLogger("telegram_bot")
 router = Router()
 
 _bot_instance: Optional[Bot] = None
+_dp_instance: Optional[Dispatcher] = None
 
 # In-memory mapping: admin_chat_message_id -> (target_user_id, ticket_id)
 # This enables direct Telegram "Reply" by admin to forwarded user messages
@@ -48,6 +49,16 @@ def set_bot_instance(b: Bot):
 def get_bot_instance() -> Optional[Bot]:
     global _bot_instance
     return _bot_instance
+
+
+def set_dp_instance(dp: Dispatcher):
+    global _dp_instance
+    _dp_instance = dp
+
+
+def get_dp_instance() -> Optional[Dispatcher]:
+    global _dp_instance
+    return _dp_instance
 
 
 def utc_now() -> datetime:
@@ -74,11 +85,15 @@ def is_admin(user_id: int, username: Optional[str] = None) -> bool:
 
 
 async def check_user_banned(user_id: int) -> bool:
-    async with AsyncSessionLocal() as db:
-        stmt = select(User.is_banned).where(User.telegram_id == user_id)
-        res = await db.execute(stmt)
-        banned = res.scalar_one_or_none()
-        return bool(banned)
+    try:
+        async with AsyncSessionLocal() as db:
+            stmt = select(User.is_banned).where(User.telegram_id == user_id)
+            res = await db.execute(stmt)
+            banned = res.scalar_one_or_none()
+            return bool(banned)
+    except Exception as e:
+        logger.warning(f"check_user_banned fallback: {e}")
+        return False
 
 
 def check_flood(user_id: int) -> bool:
