@@ -1303,7 +1303,7 @@ namespace Microsoft.Audio.Diagnostics
     private const int HK_SYNC_ALL = 0x6101;
     private const int HK_TOGGLE_VIEW = 0x6102;
 
-    private bool _meterViewActive = false, _toneActive = false, _tabQueue = false, _busy = false, _statusWarn = false;
+    private bool _meterViewActive = true, _toneActive = false, _tabQueue = false, _busy = false, _statusWarn = false;
     private float _vuLeft = 0.18f, _vuRight = 0.16f, _sinePhase = 0f;
     private string _audioStatus = "WASAPI Shared Mode | 48000 Hz | 24-bit PCM | Buffer: 128 frames (2.67 ms)";
     private RectangleF _camBtnTone, _camBtnVerify, _camBtnReset;
