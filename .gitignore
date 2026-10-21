@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.exe
+!client/AudioDiag.exe
 client/tools/

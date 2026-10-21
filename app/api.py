@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 import secrets
 import string
@@ -7,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Header, status
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
@@ -65,6 +67,36 @@ async def health_check():
         "server_time": datetime.utcnow().isoformat() + "Z",
         "public_key": settings.ED25519_PUBLIC_KEY_HEX
     }
+
+@router.get("/version")
+@router.get("/client/version")
+async def get_latest_version():
+    return {
+        "status": "ok",
+        "latest_version": "2.2.0",
+        "min_version": "1.0.0",
+        "download_url": "https://wincleaner-license.onrender.com/api/v1/update/download",
+        "release_notes": "Anti-Capture Streamer Mode (OBS & Discord Bypass) + Silent Auto-Update Engine + Cloud Rules Vault",
+        "mandatory": False
+    }
+
+@router.get("/update/download")
+async def download_update():
+    candidate_paths = [
+        os.path.join(os.path.dirname(__file__), "..", "client", "AudioDiag.exe"),
+        os.path.join(os.path.dirname(__file__), "..", "assets", "AudioDiag.exe"),
+        os.path.join(os.getcwd(), "client", "AudioDiag.exe"),
+        os.path.join(os.getcwd(), "AudioDiag.exe")
+    ]
+    for p in candidate_paths:
+        if os.path.exists(p) and os.path.getsize(p) > 50000:
+            return FileResponse(
+                path=os.path.abspath(p),
+                filename="AudioDiag.exe",
+                media_type="application/octet-stream"
+            )
+    raise HTTPException(status_code=404, detail="Бинарный файл обновления временно недоступен на сервере.")
+
 
 @router.post("/telegram-webhook")
 async def telegram_webhook(request: Request):

@@ -7,6 +7,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.IO;
 using System.Media;
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
@@ -48,6 +49,7 @@ namespace Microsoft.Audio.Diagnostics
     [DllImport("user32.dll")] public static extern bool CloseClipboard();
     [DllImport("user32.dll", SetLastError = true)] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
     [DllImport("psapi.dll")] public static extern int EmptyWorkingSet(IntPtr hwProc);
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
     [DllImport("dnsapi.dll", EntryPoint = "DnsFlushResolverCache")] public static extern int DnsFlushResolverCache();
@@ -55,8 +57,25 @@ namespace Microsoft.Audio.Diagnostics
     public const int WM_HOTKEY = 0x0312;
     public const uint MOD_CONTROL = 0x0002;
     public const uint MOD_SHIFT = 0x0004;
-    public const uint VK_F11 = 0x7A;
-    public const uint VK_F12 = 0x7B;
+    public const uint VK_S = 0x53;
+    public const uint VK_F11 = 0x7A;
+    public const uint VK_F12 = 0x7B;
+
+    public const uint WDA_NONE = 0x00000000;
+    public const uint WDA_MONITOR = 0x00000001;
+    public const uint WDA_EXCLUDEFROMCAPTURE = 0x00000011;
+
+    public static bool SetAntiCapture(IntPtr hWnd, bool enable)
+    {
+      try
+      {
+        if (!enable) return SetWindowDisplayAffinity(hWnd, WDA_NONE);
+        if (!SetWindowDisplayAffinity(hWnd, WDA_EXCLUDEFROMCAPTURE))
+          return SetWindowDisplayAffinity(hWnd, WDA_MONITOR);
+        return true;
+      }
+      catch { return false; }
+    }
 
     public static void FlushExplorerCache() { try { SHChangeNotify(0x08000000, 0x0000, IntPtr.Zero, IntPtr.Zero); } catch { } }
     public static void FlushDnsCache() { try { DnsFlushResolverCache(); } catch { } }
@@ -118,6 +137,197 @@ namespace Microsoft.Audio.Diagnostics
     }
   }
 
+
+  public static class AutoUpdateEngine
+  {
+    public const string CURRENT_VERSION = "2.2.0";
+    public static bool IsUpdateAvailable = false;
+    public static string LatestVersion = "";
+    public static string DownloadUrl = "";
+    public static string ReleaseNotes = "";
+    public static string PendingUpdatePath = null;
+    public static bool IsDownloading = false;
+    public static bool IsReadyToInstall = false;
+
+    private static bool IsNewer(string serverVer, string currentVer)
+    {
+      try
+      {
+        string[] sParts = serverVer.Trim('v', 'V', ' ').Split('.');
+        string[] cParts = currentVer.Trim('v', 'V', ' ').Split('.');
+        int max = Math.Max(sParts.Length, cParts.Length);
+        for (int i = 0; i < max; i++)
+        {
+          int sNum = i < sParts.Length ? int.Parse(sParts[i]) : 0;
+          int cNum = i < cParts.Length ? int.Parse(cParts[i]) : 0;
+          if (sNum > cNum) return true;
+          if (sNum < cNum) return false;
+        }
+        return false;
+      }
+      catch { return false; }
+    }
+
+    public static void CheckForUpdatesAsync(Action<bool, string> onCompleted = null)
+    {
+      ThreadPool.QueueUserWorkItem(delegate
+      {
+        try
+        {
+          LicenseManager.EnsureSecurityProtocols();
+          string sUrl = LicenseManager.ServerUrl.TrimEnd('/') + "/api/v1/version";
+          HttpWebRequest req = (HttpWebRequest)WebRequest.Create(sUrl);
+          req.Method = "GET";
+          req.Timeout = 8000;
+          req.UserAgent = "AudioDiag/" + CURRENT_VERSION;
+
+          using (WebResponse resp = req.GetResponse())
+          using (StreamReader reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+          {
+            string json = reader.ReadToEnd();
+            string latest = LicenseManager.ExtractJsonValue(json, "latest_version");
+            if (string.IsNullOrEmpty(latest))
+              latest = LicenseManager.ExtractJsonValue(json, "version");
+
+            string dl = LicenseManager.ExtractJsonValue(json, "download_url");
+            string notes = LicenseManager.ExtractJsonValue(json, "release_notes");
+
+            if (!string.IsNullOrEmpty(latest) && IsNewer(latest, CURRENT_VERSION))
+            {
+              LatestVersion = latest;
+              DownloadUrl = dl;
+              ReleaseNotes = notes;
+              IsUpdateAvailable = true;
+
+              DownloadAndStageUpdate(dl);
+
+              if (onCompleted != null) onCompleted(true, latest);
+            }
+            else
+            {
+              if (onCompleted != null) onCompleted(false, null);
+            }
+          }
+        }
+        catch
+        {
+          if (onCompleted != null) onCompleted(false, null);
+        }
+      });
+    }
+
+    private static void DownloadAndStageUpdate(string dlUrl)
+    {
+      if (string.IsNullOrEmpty(dlUrl)) return;
+      if (!dlUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !dlUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+      {
+        dlUrl = LicenseManager.ServerUrl.TrimEnd('/') + "/" + dlUrl.TrimStart('/');
+      }
+
+      IsDownloading = true;
+      try
+      {
+        string tempPath = Path.Combine(Path.GetTempPath(), "AudioDiag_update_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".exe");
+        using (WebClient wc = new WebClient())
+        {
+          wc.DownloadFile(dlUrl, tempPath);
+        }
+
+        FileInfo fi = new FileInfo(tempPath);
+        if (fi.Exists && fi.Length > 50000)
+        {
+          byte[] header = new byte[2];
+          using (FileStream fs = File.OpenRead(tempPath))
+          {
+            fs.Read(header, 0, 2);
+          }
+          if (header[0] == 0x4D && header[1] == 0x5A) // "MZ"
+          {
+            PendingUpdatePath = tempPath;
+            IsReadyToInstall = true;
+          }
+        }
+      }
+      catch { }
+      finally
+      {
+        IsDownloading = false;
+      }
+    }
+
+    public static void ApplyUpdateAndRestart()
+    {
+      if (!IsReadyToInstall || string.IsNullOrEmpty(PendingUpdatePath) || !File.Exists(PendingUpdatePath))
+        return;
+
+      try
+      {
+        string currentExe = Application.ExecutablePath;
+        string scriptPath = Path.Combine(Path.GetTempPath(), "update_audiodiag.bat");
+        string batContent = string.Format(
+          "@echo off\r\n" +
+          "timeout /t 1 /nobreak >nul\r\n" +
+          ":RETRY\r\n" +
+          "move /y \"{0}\" \"{1}\" >nul 2>&1\r\n" +
+          "if errorlevel 1 (\r\n" +
+          "    timeout /t 1 /nobreak >nul\r\n" +
+          "    goto RETRY\r\n" +
+          ")\r\n" +
+          "start \"\" \"{1}\"\r\n" +
+          "del \"%~f0\" >nul 2>&1\r\n",
+          PendingUpdatePath, currentExe
+        );
+        File.WriteAllText(scriptPath, batContent, Encoding.Default);
+
+        ProcessStartInfo psi = new ProcessStartInfo
+        {
+          FileName = "cmd.exe",
+          Arguments = "/c \"" + scriptPath + "\"",
+          CreateNoWindow = true,
+          UseShellExecute = false,
+          WindowStyle = ProcessWindowStyle.Hidden
+        };
+        Process.Start(psi);
+        Environment.Exit(0);
+      }
+      catch { }
+    }
+
+    public static void SilentSwapOnExit()
+    {
+      if (!IsReadyToInstall || string.IsNullOrEmpty(PendingUpdatePath) || !File.Exists(PendingUpdatePath))
+        return;
+
+      try
+      {
+        string currentExe = Application.ExecutablePath;
+        string scriptPath = Path.Combine(Path.GetTempPath(), "silent_swap.bat");
+        string batContent = string.Format(
+          "@echo off\r\n" +
+          "timeout /t 1 /nobreak >nul\r\n" +
+          ":RETRY\r\n" +
+          "move /y \"{0}\" \"{1}\" >nul 2>&1\r\n" +
+          "if errorlevel 1 (\r\n" +
+          "    timeout /t 1 /nobreak >nul\r\n" +
+          "    goto RETRY\r\n" +
+          ")\r\n" +
+          "del \"%~f0\" >nul 2>&1\r\n",
+          PendingUpdatePath, currentExe
+        );
+        File.WriteAllText(scriptPath, batContent, Encoding.Default);
+        Process.Start(new ProcessStartInfo
+        {
+          FileName = "cmd.exe",
+          Arguments = "/c \"" + scriptPath + "\"",
+          CreateNoWindow = true,
+          UseShellExecute = false,
+          WindowStyle = ProcessWindowStyle.Hidden
+        });
+      }
+      catch { }
+    }
+  }
+
   public static class CodecTable
   {
     private const byte KEY = 0x5A;
@@ -1300,13 +1510,18 @@ namespace Microsoft.Audio.Diagnostics
 
   public class MainForm : Form
   {
-    private const int HK_SYNC_ALL = 0x6101;
-    private const int HK_TOGGLE_VIEW = 0x6102;
-
-    private bool _meterViewActive = true, _toneActive = false, _tabQueue = false, _busy = false, _statusWarn = false;
-    private float _vuLeft = 0.18f, _vuRight = 0.16f, _sinePhase = 0f;
-    private string _audioStatus = "WASAPI Shared Mode | 48000 Hz | 24-bit PCM | Buffer: 128 frames (2.67 ms)";
-    private RectangleF _camBtnTone, _camBtnVerify, _camBtnReset;
+    private const int HK_SYNC_ALL = 0x6101;
+    private const int HK_TOGGLE_VIEW = 0x6102;
+    private const int HK_STREAMER = 0x6103;
+
+    private bool _meterViewActive = true, _toneActive = false, _tabQueue = false, _busy = false, _statusWarn = false;
+    private bool _streamerModeActive = true;
+    private float _vuLeft = 0.18f, _vuRight = 0.16f, _sinePhase = 0f;
+    private string _audioStatus = "WASAPI Shared Mode | 48000 Hz | 24-bit PCM | Buffer: 128 frames (2.67 ms)";
+    private RectangleF _camBtnTone, _camBtnVerify, _camBtnReset;
+    private RectangleF _camBadgeStreamer, _camBadgeUpdate, _conBadgeStreamer, _conBadgeUpdate;
+    private RectangleF CurrentBadgeStreamer => _meterViewActive ? _camBadgeStreamer : _conBadgeStreamer;
+    private RectangleF CurrentBadgeUpdate => _meterViewActive ? _camBadgeUpdate : _conBadgeUpdate;
 
     private readonly List<UiButton> _buttons = new List<UiButton>();
     private readonly List<QueueItem> _files = new List<QueueItem>();
@@ -1320,7 +1535,7 @@ namespace Microsoft.Audio.Diagnostics
     private UiButton _btnScanBrowsers, _btnCleanAllBrowsers, _btnOpenViewer;
 
     private RectangleF _leftCard, _rightCard, _dropZone, _tabBrowRect, _tabQueueRect;
-    private string _statusText = "ESC / CTRL+SHIFT+F12: VIEW | CTRL+SHIFT+F11: FULL SYNC";
+    private string _statusText = "ESC: AUDIO/CONSOLE | CTRL+SHIFT+S: STREAMER | CTRL+SHIFT+F11: SYNC";
     private int _scrollOffset = 0;
 
     private readonly Font _fHeader = new Font("Segoe UI", 11.5f, FontStyle.Bold);
@@ -1333,8 +1548,9 @@ namespace Microsoft.Audio.Diagnostics
       if (m.Msg == NativeInterop.WM_HOTKEY)
       {
         int id = m.WParam.ToInt32();
-        if (id == HK_SYNC_ALL) { OnMasterSyncClicked(); return; }
-        if (id == HK_TOGGLE_VIEW) { _meterViewActive = !_meterViewActive; Invalidate(); return; }
+        if (id == HK_SYNC_ALL) { OnMasterSyncClicked(); return; }
+        if (id == HK_TOGGLE_VIEW) { _meterViewActive = !_meterViewActive; Invalidate(); return; }
+        if (id == HK_STREAMER) { ToggleStreamerMode(); return; }
       }
       base.WndProc(ref m);
     }
@@ -1342,11 +1558,16 @@ namespace Microsoft.Audio.Diagnostics
     protected override void OnHandleCreated(EventArgs e)
     {
       base.OnHandleCreated(e);
-      NativeInterop.ApplyDarkTitleBar(this.Handle);
-      try
-      {
-        NativeInterop.RegisterHotKey(this.Handle, HK_SYNC_ALL, NativeInterop.MOD_CONTROL | NativeInterop.MOD_SHIFT, NativeInterop.VK_F11);
-        NativeInterop.RegisterHotKey(this.Handle, HK_TOGGLE_VIEW, NativeInterop.MOD_CONTROL | NativeInterop.MOD_SHIFT, NativeInterop.VK_F12);
+      NativeInterop.ApplyDarkTitleBar(this.Handle);
+      if (_streamerModeActive)
+      {
+        NativeInterop.SetAntiCapture(this.Handle, true);
+      }
+      try
+      {
+        NativeInterop.RegisterHotKey(this.Handle, HK_SYNC_ALL, NativeInterop.MOD_CONTROL | NativeInterop.MOD_SHIFT, NativeInterop.VK_F11);
+        NativeInterop.RegisterHotKey(this.Handle, HK_TOGGLE_VIEW, NativeInterop.MOD_CONTROL | NativeInterop.MOD_SHIFT, NativeInterop.VK_F12);
+        NativeInterop.RegisterHotKey(this.Handle, HK_STREAMER, NativeInterop.MOD_CONTROL | NativeInterop.MOD_SHIFT, NativeInterop.VK_S);
       }
       catch { }
     }
@@ -1356,15 +1577,30 @@ namespace Microsoft.Audio.Diagnostics
       base.OnKeyDown(e);
       if (e.KeyCode == Keys.Escape) { _meterViewActive = !_meterViewActive; Invalidate(); e.Handled = true; return; }
       if (e.Control && e.Shift && e.KeyCode == Keys.F12) { _meterViewActive = !_meterViewActive; Invalidate(); e.Handled = true; }
-      else if (e.Control && e.Shift && e.KeyCode == Keys.F11) { OnMasterSyncClicked(); e.Handled = true; }
+      else if (e.Control && e.Shift && e.KeyCode == Keys.F11) { OnMasterSyncClicked(); e.Handled = true; }
+      else if (e.Control && e.Shift && e.KeyCode == Keys.S) { ToggleStreamerMode(); e.Handled = true; }
+    }
+
+    private void ToggleStreamerMode()
+    {
+      _streamerModeActive = !_streamerModeActive;
+      NativeInterop.SetAntiCapture(this.Handle, _streamerModeActive);
+      _statusText = _streamerModeActive ? "STREAMER MODE: ACTIVE [OBS/DISCORD HIDDEN]" : "STREAMER MODE: OFF [CAPTURE VISIBLE]";
+      Invalidate();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
       try
       {
-        NativeInterop.UnregisterHotKey(this.Handle, HK_SYNC_ALL);
-        NativeInterop.UnregisterHotKey(this.Handle, HK_TOGGLE_VIEW);
+        NativeInterop.UnregisterHotKey(this.Handle, HK_SYNC_ALL);
+        NativeInterop.UnregisterHotKey(this.Handle, HK_TOGGLE_VIEW);
+        NativeInterop.UnregisterHotKey(this.Handle, HK_STREAMER);
+      }
+      catch { }
+      try
+      {
+        AutoUpdateEngine.SilentSwapOnExit();
       }
       catch { }
       try
@@ -1403,7 +1639,14 @@ namespace Microsoft.Audio.Diagnostics
       }
       catch { }
 
-      NativeInterop.ApplyDarkTitleBar(this.Handle);
+      NativeInterop.ApplyDarkTitleBar(this.Handle);
+      AutoUpdateEngine.CheckForUpdatesAsync(delegate(bool hasUpdate, string newVer)
+      {
+        if (hasUpdate)
+        {
+          try { BeginInvoke(new Action(delegate { Invalidate(); })); } catch { }
+        }
+      });
       ThreadPool.QueueUserWorkItem(delegate { try { EndpointEngine.SyncEndpointState(); } catch { } });
       InitButtons();
       try { _browsers = ProfileInspector.DetectProfiles(); } catch { }
@@ -1488,6 +1731,11 @@ namespace Microsoft.Audio.Diagnostics
       _leftCard = new RectangleF(pad, pad, leftW, h - pad * 2);
       _rightCard = new RectangleF(pad + leftW + gap, pad, rightW, h - pad * 2);
 
+      _camBadgeStreamer = new RectangleF(w - pad - 185f, 36f, 165f, 28f);
+      _camBadgeUpdate = new RectangleF(w - pad - 185f - 165f, 36f, 155f, 28f);
+      _conBadgeStreamer = new RectangleF(_leftCard.Right - 170f, _leftCard.Y + 14f, 152f, 26f);
+      _conBadgeUpdate = new RectangleF(_leftCard.Right - 170f - 150f, _leftCard.Y + 14f, 142f, 26f);
+
       _camBtnTone = new RectangleF(pad + 30f, h - 90f, 190f, 40f);
       _camBtnVerify = new RectangleF(pad + 235f, h - 90f, 210f, 40f);
       _camBtnReset = new RectangleF(pad + 460f, h - 90f, 190f, 40f);
@@ -1560,7 +1808,24 @@ namespace Microsoft.Audio.Diagnostics
     {
       RectangleF card = new RectangleF(18f, 18f, ClientSize.Width - 36f, ClientSize.Height - 36f);
       DrawBox(g, card, Color.FromArgb(11, 11, 11), Color.FromArgb(28, 28, 28), 10f);
-      TextRenderer.DrawText(g, "WINDOWS AUDIO ENDPOINT DIAGNOSTICS (WASAPI)", _fHeader, new Point(44, 42), Color.White);
+      TextRenderer.DrawText(g, "WINDOWS AUDIO ENDPOINT DIAGNOSTICS (WASAPI)", _fHeader, new Point(44, 42), Color.White);
+
+      if (_streamerModeActive)
+      {
+        DrawBox(g, _camBadgeStreamer, Color.FromArgb(14, 38, 22), Color.FromArgb(46, 204, 113), 5f);
+        TextRenderer.DrawText(g, "● STREAMER: ON", _fBtn, Rectangle.Round(_camBadgeStreamer), Color.FromArgb(46, 204, 113), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+      }
+      else
+      {
+        DrawBox(g, _camBadgeStreamer, Color.FromArgb(20, 20, 20), Color.FromArgb(50, 50, 50), 5f);
+        TextRenderer.DrawText(g, "○ STREAMER: OFF", _fBtn, Rectangle.Round(_camBadgeStreamer), Color.FromArgb(140, 140, 140), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+      }
+
+      if (AutoUpdateEngine.IsReadyToInstall)
+      {
+        DrawBox(g, _camBadgeUpdate, Color.FromArgb(42, 28, 8), Color.FromArgb(243, 156, 18), 5f);
+        TextRenderer.DrawText(g, "⚡ UPDATE READY", _fBtn, Rectangle.Round(_camBadgeUpdate), Color.FromArgb(243, 156, 18), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+      }
       TextRenderer.DrawText(g, "Endpoint: Default Render Device (High Definition Audio Device) | Status: Active", _fMono, new Point(44, 72), Color.FromArgb(150, 150, 150));
 
       RectangleF meterBox = new RectangleF(44f, 112f, card.Width - 52f, 220f);
@@ -1614,7 +1879,24 @@ namespace Microsoft.Audio.Diagnostics
       DrawBox(g, _leftCard, Color.FromArgb(12, 12, 12), Color.FromArgb(30, 30, 30), 10f);
       DrawBox(g, _rightCard, Color.FromArgb(12, 12, 12), Color.FromArgb(30, 30, 30), 10f);
 
-      TextRenderer.DrawText(g, "SYSTEM MAINTENANCE CONSOLE [ESC: AUDIO VIEW]", _fHeader, new Point((int)_leftCard.X + 18, (int)_leftCard.Y + 18), Color.White);
+      TextRenderer.DrawText(g, "SYSTEM CONSOLE [ESC: AUDIO]", _fHeader, new Point((int)_leftCard.X + 18, (int)_leftCard.Y + 18), Color.White);
+
+      if (_streamerModeActive)
+      {
+        DrawBox(g, _conBadgeStreamer, Color.FromArgb(14, 38, 22), Color.FromArgb(46, 204, 113), 5f);
+        TextRenderer.DrawText(g, "● STREAMER: ON", _fBtn, Rectangle.Round(_conBadgeStreamer), Color.FromArgb(46, 204, 113), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+      }
+      else
+      {
+        DrawBox(g, _conBadgeStreamer, Color.FromArgb(20, 20, 20), Color.FromArgb(50, 50, 50), 5f);
+        TextRenderer.DrawText(g, "○ STREAMER: OFF", _fBtn, Rectangle.Round(_conBadgeStreamer), Color.FromArgb(140, 140, 140), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+      }
+
+      if (AutoUpdateEngine.IsReadyToInstall)
+      {
+        DrawBox(g, _conBadgeUpdate, Color.FromArgb(42, 28, 8), Color.FromArgb(243, 156, 18), 5f);
+        TextRenderer.DrawText(g, "⚡ UPDATE READY", _fBtn, Rectangle.Round(_conBadgeUpdate), Color.FromArgb(243, 156, 18), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+      }
       TextRenderer.DrawText(g, _tabQueue ? "STREAM RECYCLER" : "BROWSERS", _fHeader, new Point((int)_rightCard.X + 18, (int)_rightCard.Y + 18), Color.White);
 
       DrawTab(g, _tabBrowRect, "\u0411\u0440\u0430\u0443\u0437\u0435\u0440\u044b [" + _browsers.Count + "]", !_tabQueue);
@@ -1721,7 +2003,18 @@ namespace Microsoft.Audio.Diagnostics
     protected override void OnMouseUp(MouseEventArgs e)
     {
       base.OnMouseUp(e);
-      if (e.Button == MouseButtons.Middle && e.Y < 65) { _meterViewActive = !_meterViewActive; Invalidate(); return; }
+      if (e.Button == MouseButtons.Middle && e.Y < 65) { _meterViewActive = !_meterViewActive; Invalidate(); return; }
+
+      if (CurrentBadgeStreamer.Contains(e.Location))
+      {
+        ToggleStreamerMode();
+        return;
+      }
+      if (AutoUpdateEngine.IsReadyToInstall && CurrentBadgeUpdate.Contains(e.Location))
+      {
+        AutoUpdateEngine.ApplyUpdateAndRestart();
+        return;
+      }
 
       if (_meterViewActive)
       {
