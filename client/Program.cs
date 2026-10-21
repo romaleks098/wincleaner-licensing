@@ -3513,7 +3513,7 @@ namespace WinCleaner
             _btnOpenBHV = new VirtualGlassButton
             {
                 Id = "open_bhv",
-                Title = "BrowsingHistoryView",
+                Title = "Открыть BHV",
                 Subtitle = "",
                 RightTag = "",
                 Icon = IconKind.Shield,
@@ -3608,7 +3608,7 @@ namespace WinCleaner
             float btnGap = 12f;
             float btnW = (rw - btnGap * 2f) / 3f;
 
-            float tabW = 135f;
+            float tabW = 120f;
             float tabH = 26f;
             float tabY = _rightCardRect.Y + 18f;
             float tabX = _rightCardRect.Right - (tabW * 2f + 24f);
@@ -3937,7 +3937,7 @@ namespace WinCleaner
 
             if (_activeTab == RightTabMode.Browsers)
             {
-                TextRenderer.DrawText(g, "Аудит и зачистка браузеров", _fontCardTitle,
+                TextRenderer.DrawText(g, "Аудит браузеров", _fontCardTitle,
                     new Point((int)hx, (int)hy), Color.White, TextFormatFlags.NoPadding);
 
                 DrawGlassSurface(g, _dropZoneRect, 18f,
